@@ -28,17 +28,17 @@ The model is a **form-filling clerk**; your application is the **back office**.
 ```
    Natural-language world                      Typed world (your code)
  ┌────────────────────────┐    contract    ┌──────────────────────────────────────────┐
- │ user goal, documents,  │ ─────────────► │ AgentDecision (discriminated union)      │
+ │ user goal, documents,  │ ─────────────> │ AgentDecision (discriminated union)      │
  │ conversation           │   JSON Schema  │   ├─ Answer                              │
  │                        │                │   ├─ AskClarification                    │
  │      LLM (judgment)    │                │   ├─ ProposeRefund(order_id, reason)     │
  │                        │                │   ├─ ProposeAddressChange(...)           │
  └────────────────────────┘                │   └─ Escalate / Refuse                   │
                                            └──────────────┬───────────────────────────┘
-                                                          ▼
-                    parse ─► validate (shape) ─► resolve (load real records)
-                         ─► check invariants (business rules, state machine)
-                         ─► authorize (policy engine)  ─► approve? ─► execute
+                                                          v
+                    parse ─> validate (shape) ─> resolve (load real records)
+                         ─> check invariants (business rules, state machine)
+                         ─> authorize (policy engine)  ─> approve? ─> execute
 ```
 
 Three ideas to hold on to:
@@ -221,9 +221,9 @@ Not all failures deserve the same treatment. Classify first:
 **State machines for actions.** Model each proposal's lifecycle explicitly (Unit 43 reuses this):
 
 ```
-proposed ──validate──► validated ──authorize──► approved/auto_approved ──execute──► executed
+proposed ──validate──> validated ──authorize──> approved/auto_approved ──execute──> executed
     │                       │                         │                              │
-    └──► rejected_invalid   └──► rejected_policy      └──► expired/rejected          └──► failed
+    └──> rejected_invalid   └──> rejected_policy      └──> expired/rejected          └──> failed
 ```
 
 Transitions are functions that check guards and raise on illegal moves.
@@ -306,11 +306,11 @@ OPA 1.0 (released December 2024) made the `if`/`contains` keywords mandatory; ol
 #### 5.1 What Pydantic does on `validate_json`
 
 ```
-raw bytes ──► pydantic-core JSON parser (Rust, jiter) ──► Python-independent values
-          ──► discriminator lookup: read "kind" ──► select branch schema (O(1) dict lookup)
-          ──► validate fields in branch: type checks, constraints, nested models
-          ──► collect *all* errors for the branch (not just the first)
-          ──► construct model instance (frozen → hash/eq semantics; no __setattr__)
+raw bytes ──> pydantic-core JSON parser (Rust, jiter) ──> Python-independent values
+          ──> discriminator lookup: read "kind" ──> select branch schema (O(1) dict lookup)
+          ──> validate fields in branch: type checks, constraints, nested models
+          ──> collect *all* errors for the branch (not just the first)
+          ──> construct model instance (frozen → hash/eq semantics; no __setattr__)
 ```
 
 * Validating **JSON directly** (`validate_json`) is faster than `json.loads` + `validate_python` and applies JSON-mode coercion rules (e.g., strings accepted for `Decimal`).
@@ -326,16 +326,16 @@ raw bytes ──► pydantic-core JSON parser (Rust, jiter) ──► Python-ind
 ```
 model output (JSON)
   │ 1 parse+validate (Pydantic)            → ValidationError → retry-with-feedback (≤ N) → escalate
-  ▼
+  v
 typed decision (e.g. ProposeRefund)
   │ 2 resolve references (DB lookups)      → NotFound → tool error to model / ask clarification
-  ▼
+  v
 resolved command (Order, LineItems, computed amount)
   │ 3 invariants (domain service)          → InvariantViolation → explain to user, no retry
-  ▼
+  v
 valid command
   │ 4 policy engine (facts only)           → deny | require_approval | allow
-  ▼
+  v
 authorized command
   │ 5 execute (idempotent, transactional)  → audit + outcome
 ```

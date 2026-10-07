@@ -37,17 +37,17 @@ In system terms:
 ```
  Agent loop                  Approval service (durable)                    Humans
  ──────────                  ──────────────────────────                    ──────
- decision: ProposeRefund ─►  validate → resolve → policy = REQUIRE_APPROVAL
+ decision: ProposeRefund ─>  validate → resolve → policy = REQUIRE_APPROVAL
                              persist Proposal(status=pending, payload, hash,
                                               reviewer_context, expires_at)
- agent pauses  ◄──────────── returns proposal_id ("waiting for approval")
- (state checkpointed)                         │ notify ─────────────────────► reviewer queue / Slack
+ agent pauses  <──────────── returns proposal_id ("waiting for approval")
+ (state checkpointed)                         │ notify ─────────────────────> reviewer queue / Slack
                                               │                              reviewer opens proposal
-                                              │ ◄── decision(approve|reject, comment, payload_hash)
+                                              │ <── decision(approve|reject, comment, payload_hash)
                              atomic CAS pending→approved|rejected (if not expired)
                              approved → executor re-validates → execute once
                              persist Execution + AuditEvents
- agent resumes ◄──────────── event: proposal decided/executed/expired
+ agent resumes <──────────── event: proposal decided/executed/expired
  tells user the real outcome
 ```
 
@@ -172,12 +172,12 @@ audit_events          append-only timeline
 **Status state machine:**
 
 ```
-                 ┌─────────── reject ───────────► rejected (terminal)
- pending ────────┼─────────── approve ──────────► approved ──execute──► executed (terminal)
+                 ┌─────────── reject ───────────> rejected (terminal)
+ pending ────────┼─────────── approve ──────────> approved ──execute──> executed (terminal)
    │             │                                   │
-   │             └── (N-of-M: approve until quorum)  └──execute fails──► failed (terminal; may create new proposal)
-   └── expires_at passes ──────────────────────────► expired (terminal)
- pending ── requester cancels ─────────────────────► cancelled (terminal)
+   │             └── (N-of-M: approve until quorum)  └──execute fails──> failed (terminal; may create new proposal)
+   └── expires_at passes ──────────────────────────> expired (terminal)
+ pending ── requester cancels ─────────────────────> cancelled (terminal)
 ```
 
 **Concurrency control.** Two reviewers clicking "Approve" simultaneously, or "Approve" racing with expiry, must result in exactly one outcome. Use an atomic conditional update:
@@ -236,7 +236,7 @@ and a `UNIQUE(proposal_id)` constraint on `executions` so that a duplicated exec
 #### 5.1 End-to-end sequence for a high-risk refund
 
 ```
-1  POST /v1/agent/chat ─► agent decides ProposeRefund (Unit 42)
+1  POST /v1/agent/chat ─> agent decides ProposeRefund (Unit 42)
 2  resolve → amount = 120.00 (code) → policy: REQUIRE_APPROVAL ("> limit 50")
 3  BEGIN; INSERT proposals(status=pending, payload_sha256=H, expires_at=now+4h);
          INSERT audit_events('proposed'); INSERT outbox('proposal.created'); COMMIT

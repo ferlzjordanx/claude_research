@@ -48,13 +48,13 @@ The core structural fact:
   └──────────┬────────────┘            │ web pages, emails, tickets, PDFs     │
              │                         │ tool results, other agents' output   │
              │                         └────────────────┬────────────────────┘
-             ▼                                          ▼
+             v                                          v
         ┌────────────────────────────────────────────────────┐
         │            ONE TOKEN SEQUENCE (the context)         │  ← the model sees no
         └────────────────────────┬───────────────────────────┘    hard boundary here
-                                 ▼
+                                 v
                          model output (proposal)
-                                 ▼
+                                 v
         ═══════════════ DETERMINISTIC SECURITY BOUNDARY ═══════════════
           authenticate → authorize → validate → approve? → execute
 ```
@@ -242,13 +242,13 @@ class ToolSpec:
 Validation happens at **four** boundaries, not one:
 
 ```
- user input ──► [1 input validation] ──► model ──► [2 output/decision validation]
+ user input ──> [1 input validation] ──> model ──> [2 output/decision validation]
                                                               │
                                     [3 tool-argument validation + authorization]
                                                               │
-                                              tool ──► [4 tool-result handling]
+                                              tool ──> [4 tool-result handling]
                                                               │
-                                     model ──► final answer ──► [2' output handling for rendering]
+                                     model ──> final answer ──> [2' output handling for rendering]
 ```
 
 **1. Input validation.** Size limits (tokens/characters), encoding normalization (Unicode NFKC, strip zero-width characters if your domain allows), attachment type checks, rate limits per principal, optional injection/abuse classifiers. Input validation reduces noise and cost; it **cannot** be your injection defense.
@@ -301,12 +301,12 @@ Note that `strict=True` rejects `"12.50"` as a string for a `Decimal` field in P
 ```
 User (sub=alice, tenant=acme, scopes=[orders:read, refunds:create<=200])
    │  access token (aud=supportops-api)
-   ▼
+   v
 SupportOps API ── validates token, builds Principal
    │
    ├─ Agent session: tools filtered by Principal scopes
    │
-   └─ Tool executor ──► Payments API
+   └─ Tool executor ──> Payments API
             uses *its own* token: aud=payments-api, scope=refunds:create,
             tenant=acme, act={sub: alice}  (token exchange, short-lived)
 ```
@@ -447,12 +447,12 @@ async def authorize_or_deny(check) -> bool:
 #### 5.1 What actually happens during a tool call
 
 ```
-1. HTTP request arrives ─► FastAPI dependency resolves Principal from JWT (signature, iss, aud, exp)
+1. HTTP request arrives ─> FastAPI dependency resolves Principal from JWT (signature, iss, aud, exp)
 2. Orchestrator builds tool list = ALL_TOOLS ∩ tools_allowed(principal)        (surface reduction)
 3. Context assembled: system prompt + history + user message
         + retrieved chunks (tagged provenance=kb, trust=internal)
         + tool results (tagged provenance=tool:<name>, trust=untrusted if external text)
-4. Model call ─► provider returns either text or tool_use{name, input JSON}
+4. Model call ─> provider returns either text or tool_use{name, input JSON}
 5. Parse: unknown tool name? → reject (never dispatch by getattr on model-provided names)
 6. Validate: args_model.model_validate(input) → ValidationError → structured error back to model
 7. Authorize (deterministic): scope ∈ principal.scopes? resource.tenant == principal.tenant?

@@ -20,7 +20,7 @@ This guide covers two curriculum parts and six units:
 
 Each unit follows the same 19-section structure (learning objectives → mental model → theory → internals → examples → comparisons → failure modes → practice → project → testing → scenarios → interview prep → three-level explanations → knowledge check → traps → cheat sheet → checklist → further research) and ends with a **Unit Completion Standard**.
 
-## The Running Example: Northwind SupportOps {.unnumbered}
+### The Running Example: Northwind SupportOps {.unnumbered}
 
 All six units build on one fictional system so that concepts accumulate rather than restart:
 
@@ -28,13 +28,13 @@ All six units build on one fictional system so that concepts accumulate rather t
 
 ```
                    ┌──────────────────────────── Northwind SupportOps ───────────────────────────┐
-  Browser / CRM ─► │ FastAPI ─► AuthN ─► Agent Orchestrator ─► Model Provider (LLM)               │
+  Browser / CRM ─> │ FastAPI ─> AuthN ─> Agent Orchestrator ─> Model Provider (LLM)               │
                    │                         │                                                    │
-                   │                         ├─► Policy Engine (deterministic)                    │
-                   │                         ├─► Tool Executor ─► Orders API / Payments / Email   │
-                   │                         ├─► Retriever ─► Vector index (KB articles)          │
-                   │                         ├─► Approval Service ─► PostgreSQL (proposals/audit) │
-                   │                         └─► OpenTelemetry ─► Collector ─► Traces/Metrics     │
+                   │                         ├─> Policy Engine (deterministic)                    │
+                   │                         ├─> Tool Executor ─> Orders API / Payments / Email   │
+                   │                         ├─> Retriever ─> Vector index (KB articles)          │
+                   │                         ├─> Approval Service ─> PostgreSQL (proposals/audit) │
+                   │                         └─> OpenTelemetry ─> Collector ─> Traces/Metrics     │
                    └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -45,7 +45,7 @@ All six units build on one fictional system so that concepts accumulate rather t
 * Unit 45 makes it **observable** (one OpenTelemetry trace from HTTP request to tool call, privacy-safe).
 * Unit 46 makes it **safe to change** (versioning, drift, canaries, eval gates, circuit breakers, fallbacks).
 
-## Conventions and Versions {.unnumbered}
+### Conventions and Versions {.unnumbered}
 
 * **Python** 3.12+ (3.13 and 3.14 are current at the time of writing; all examples avoid features newer than 3.12 unless noted).
 * **FastAPI** 0.11x+, **Pydantic** v2, **SQLAlchemy** 2.x (typed `Mapped[...]` declarative style, `AsyncSession`), **pytest** 8+, **httpx**, **anyio** test plugin.

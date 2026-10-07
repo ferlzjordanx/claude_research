@@ -15,10 +15,10 @@
 ```
 Earlier parts                         This part (XV)                       Next part (XVI)
 ─────────────                         ─────────────                        ───────────────
-FastAPI, Pydantic, SQLAlchemy  ──►   Unit 41: threat model + authz   ──►  Unit 44: evaluate safety and
-Auth (OAuth2/JWT, RBAC)        ──►   Unit 42: typed decisions        ──►           task success
-RAG, tool calling, agent loops ──►   Unit 43: approvals + audit      ──►  Unit 45: trace every decision
-Async, retries, idempotency    ──►                                    ──►  Unit 46: ship changes safely
+FastAPI, Pydantic, SQLAlchemy  ──>   Unit 41: threat model + authz   ──>  Unit 44: evaluate safety and
+Auth (OAuth2/JWT, RBAC)        ──>   Unit 42: typed decisions        ──>           task success
+RAG, tool calling, agent loops ──>   Unit 43: approvals + audit      ──>  Unit 45: trace every decision
+Async, retries, idempotency    ──>                                    ──>  Unit 46: ship changes safely
 ```
 
 The single idea that runs through the whole part:
