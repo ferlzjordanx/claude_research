@@ -8,4 +8,5 @@ pandoc part16-20-src/[0-9]*.md \
   -f markdown+pipe_tables+fenced_code_blocks+task_lists \
   --reference-doc="$REF" --highlight-style=tango --toc --toc-depth=2 \
   -o "Part XVI- XX.docx"
+python3 part16-20-src/postprocess.py "Part XVI- XX.docx"
 echo "wrote Part XVI- XX.docx"

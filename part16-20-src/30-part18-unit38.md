@@ -598,7 +598,8 @@ Producers → Notification API (validate, dedupe, persist, outbox) ⇢ Kafka top
 **Architecture.**
 
 ```
-Order service → Payment API (idempotency, validation, state machine) → PSP adapter (tokenized card data; PSP idempotency keys)
+Order service → Payment API (idempotency, validation, state machine)
+   → PSP adapter (tokenized card data; PSP idempotency keys)
    → PostgreSQL (payments, ledger, outbox in one tx) ⇢ Kafka payment events → Order service, notifications
 PSP webhooks → verify signature → idempotent state transition
 Reconciliation job: daily PSP settlement files vs ledger → discrepancies → ops queue
@@ -627,8 +628,9 @@ Reconciliation job: daily PSP settlement files vs ledger → discrepancies → o
 ```
 Order API → Order service (create PENDING + outbox) ⇢ Kafka
   → Saga orchestrator (state per order):
-       ReserveInventory → Inventory service (atomic: UPDATE inventory SET available = available - q, reserved = reserved + q
-                                               WHERE sku = ? AND available >= q)
+       ReserveInventory → Inventory service (atomic:
+                            UPDATE inventory SET available = available - q, reserved = reserved + q
+                             WHERE sku = ? AND available >= q)
        ChargePayment   → Payment service (idempotent)
        ConfirmOrder    → Order service
      compensations: ReleaseInventory, RefundPayment
@@ -686,7 +688,8 @@ Search API → authZ → build query with tenant + ACL filter → hybrid retriev
 Clients ⇄ WebSocket gateways (stateful connections; L4/L7 LB with long-lived connections)
    → Connection registry (Redis: userId → gatewayId, TTL heartbeats)
    → Message service: validate membership, dedupe by clientMsgId, assign seq, persist ⇢ Kafka (key = conversationId)
-   → Fan-out workers: for each member → online? route to gateway (Redis pub/sub or gateway-specific topic) : push notification
+   → Fan-out workers: for each member → online? route to gateway (Redis pub/sub or gateway topic)
+                                         : push notification
 ```
 
 **Scaling.** Gateways scale horizontally (~50–100K connections per instance depending on memory); Kafka partitions by conversation keep per-conversation order; large groups use fan-out-on-read (members fetch from conversation log) instead of fan-out-on-write.

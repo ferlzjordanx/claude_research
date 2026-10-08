@@ -40,16 +40,16 @@ By the end of this unit you will be able to:
 Evaluation is the **exam** your agent must pass before every release, plus **spot checks** after release.
 
 ```
-                      ┌──────────── offline (pre-release) ─────────────┐
- golden dataset ──▶ eval runner ──▶ agent under test ──▶ trajectories ──▶ graders ──▶ scores ──▶ compare to baseline ──▶ gate
- (cases: input,      (N trials,      (real prompts,       (decisions,      (code,       (per case,    (thresholds,        (ship /
-  world fixtures,     fixed config)   model, tools on      tool calls,      LLM judge,   per metric,   critical = 0,       block)
-  expected/forbidden)                 fixture backends)    retrieval,       human)       per tag)      non-inferiority)
-                                                           answer, usage)
-                      └──────────────────────────────────────────────────┘
-                      ┌──────────── online (post-release) ─────────────┐
- production traffic ──▶ sampling ──▶ graders (+ user feedback, approval edits/rejections) ──▶ dashboards/alerts ──▶ new eval cases
-                      └──────────────────────────────────────────────────┘
+OFFLINE (pre-release)
+  golden dataset ──▶ eval runner ──▶ agent under test ──▶ trajectories ──▶ graders ──▶ scores ──▶ baseline ──▶ gate
+  (input, world      (k trials,      (real prompts,       (decisions,      (code,      (per case,  (compare    (ship /
+   fixtures,          fixed config)   model; tools on      tool calls,      LLM judge,  per metric, deltas,     block)
+   expected,                          fixture backends)    retrieval,       human)      per tag)    critical=0,
+   forbidden)                                              answer, usage)                           margins)
+
+ONLINE (post-release)
+  production traffic ──▶ sampling ──▶ graders (+ user feedback, approval edits/rejections)
+                     ──▶ dashboards/alerts ──▶ new offline eval cases
 ```
 
 Three ideas anchor the unit:
