@@ -1,0 +1,15 @@
+Subject: New patient appointment
+
+Hello Northwind front desk,
+
+My name is Maria Lopez and I would like to book a visit.
+
+DOB: 1985-03-14
+Phone: 555-010-1111
+Email: maria.lopez@example.com
+Insurance policy: NWH-1234567
+Reason for visit: annual physical exam
+Preferred date: 2026-10-20
+
+Thank you,
+Maria Lopez
