@@ -9024,3 +9024,3457 @@ npm run build && npm run preview
    OIDC login (PKCE), generated API types, TanStack Query for caching and retries, error monitoring (Sentry or OpenTelemetry web), accessibility review, E2E tests (Playwright), CSP headers, and CDN hosting with SPA fallback.
 5. **How would this look in Angular?**
    A `TicketsService` with `HttpClient`, an `authInterceptor` for the header and 401, signals for the state, `@if`/`@for` templates, a `CanActivateFn` guard and a reactive `FormGroup`. Same architecture, different syntax.
+
+
+# Unit 5 — End-to-End Full-Stack Development
+
+## 1. What This Unit Teaches
+
+An FDE is rarely asked to "build an API" or "build a UI" alone. The real job is a working feature that crosses the browser, the network, the API, the database and the identity provider **[JD-Required: full-stack, frontend and backend integration, end-to-end ownership]**. This unit connects Units 2–4 into one product and teaches the seams where full-stack bugs live:
+
+- the full request lifecycle, from a click to a SQL row and back;
+- the API contract as the shared source of truth (OpenAPI, generated types, contract tests);
+- CORS and when you do not need it at all (same-origin proxy);
+- authentication *and* authorization end to end, including object-level rules;
+- environment configuration for each tier;
+- correlation (request) IDs that link browser errors to backend logs;
+- a consistent error contract the UI can render;
+- the full-stack testing pyramid, including Playwright end-to-end tests.
+
+## 2. Mental Model
+
+```text
+ User clicks "Close ticket"
+   │
+   ▼
+ React component ── onChange ──► useTickets.updateStatus(id, "closed")
+   │
+   ▼
+ API client  adds: Authorization: Bearer <JWT>
+                   X-Request-ID: 9f2c…   Content-Type: application/json
+   │   (dev: Vite proxy /api → :8000, same origin, no CORS)
+   │   (prod: CloudFront/ALB routes /api → service, or CORS)
+   ▼
+ FastAPI middleware: CORS → RequestId (log context) → route
+   │
+   ▼
+ Dependencies: get_session → current_user (verify JWT) → TicketService
+   │
+   ▼
+ Service rules:  role == agent?  ticket visible to this user?
+   │
+   ▼
+ SQL: UPDATE tickets SET status='closed' WHERE id=1  (in a transaction)
+   │
+   ▼
+ Response 200 TicketOut JSON + X-Request-ID   ─or─ problem+json 4xx/5xx
+   │
+   ▼
+ SPA updates state → re-render.  On error: message + "ref 9f2c…"
+```
+
+Three ideas carry the whole unit:
+
+1. **The contract is the product boundary.** The OpenAPI schema is what the frontend, tests, and other teams depend on. Change it on purpose, never by accident.
+2. **The server is the only security boundary.** The UI hides buttons for convenience; the API enforces every rule, including *which rows* a user may see.
+3. **Every request has an identity.** A request ID created in the browser travels through every log line, so "it failed for me at 10:42" becomes one search.
+
+## 3. Brief Theory
+
+### 3.1 The request lifecycle
+
+**What it is.** The ordered path a user action takes: event handler → state → HTTP request → network (DNS, TLS, proxy, load balancer) → middleware → routing and validation → dependencies (auth, DB session) → business rules → database → serialization → response → UI state.
+
+**Why it exists.** Each layer has one job. When something breaks, knowing the order tells you where to look first: a CORS error never reaches your route; a 422 never reaches your service; a 403 never reaches SQL.
+
+**Why it matters.** Full-stack debugging is binary search over this path. Interviewers ask "walk me through what happens when…" to see whether you can.
+
+**How it works.** In this project: `TicketList` → `useTickets` → `ticketsApi` → `createApiClient` → Vite proxy → `RequestIdMiddleware` → `CORSMiddleware` → FastAPI validation → `current_user` → `TicketService` → SQLAlchemy → `TicketOut`.
+
+### 3.2 The API contract
+
+**What it is.** The agreed shape of requests and responses: paths, methods, fields, types, status codes and error formats. FastAPI generates it as OpenAPI from your Pydantic models (`/openapi.json`).
+
+**Why it exists.** Frontend and backend change at different speeds, often by different people. A written contract lets them work in parallel and detect breaks automatically.
+
+**Why it matters.** Most "the UI is broken" incidents after a deploy are contract drift: a renamed field, a new required field, a changed enum value.
+
+**How it works.**
+
+| Technique | What it catches |
+|---|---|
+| Generate TS types: `npx openapi-typescript http://…/openapi.json -o src/api/schema.d.ts` **[External]** | Field renames become compile errors |
+| Contract test in backend CI (this project: `test_contract_matches_frontend_expectations`) | Removing a field the SPA uses |
+| `extra="forbid"` on input models | Clients sending fields the server ignores (e.g. `owner`) |
+| Additive change rule: add optional fields, never rename/remove in place | Breaking older clients |
+| Versioning (`/v2/…`) or expand-and-contract migration | Unavoidable breaking changes |
+
+Consumer-driven contract testing (Pact **[External]**) formalizes this between many services; for one SPA and one API, a schema test plus generated types is usually enough.
+
+### 3.3 Same-origin, CORS and the dev proxy
+
+**What it is.** Browsers block JavaScript from reading responses from a different *origin* (scheme + host + port) unless the server opts in with CORS headers. `http://localhost:5173` and `http://localhost:8000` are different origins.
+
+**Why it exists.** Without it, any website you visit could call your bank's API with your cookies and read the result.
+
+**Why it matters.** "CORS error" is the most common full-stack integration failure, and it is purely a browser rule: curl and Postman never show it.
+
+**How it works.**
+
+```text
+ Cross-origin "non-simple" request (JSON body, Authorization header):
+
+ Browser ── OPTIONS /tickets ───────────────────────────► API
+           Origin: http://localhost:5173
+           Access-Control-Request-Method: POST
+           Access-Control-Request-Headers: authorization,content-type
+ Browser ◄── 200 ───────────────────────────────────────── API
+           Access-Control-Allow-Origin: http://localhost:5173
+           Access-Control-Allow-Headers: Authorization, Content-Type…
+ Browser ── POST /tickets (the real request) ───────────► API
+```
+
+Rules worth memorizing:
+
+- Allow-list exact origins. `allow_origins=["*"]` cannot be combined with credentials (cookies), and browsers reject it.
+- List every custom request header (`Authorization`, `X-Request-ID`) in `allow_headers`.
+- Response headers are hidden from JavaScript unless listed in `expose_headers` (that is why this project exposes `X-Request-ID`).
+- CORS is not authentication. It protects users' browsers, not your API. Anyone can still call the API with curl.
+- **Often you need no CORS at all:** the Vite dev proxy in development, and a single domain in production (CloudFront or an ALB routes `/api/*` to the service and everything else to the static SPA). Same origin removes a whole class of bugs.
+
+FastAPI reference: [CORS](https://fastapi.tiangolo.com/tutorial/cors/) **[Current]**.
+
+### 3.4 Authentication and authorization end to end
+
+**What it is.** *Authentication* proves who the caller is (login, token verification). *Authorization* decides what that caller may do: by role ("only agents change status") and by object ("requesters only see their own tickets").
+
+**Why it exists.** Function-level checks alone are not enough. The OWASP API Security Top 10 lists **Broken Object Level Authorization (BOLA)** as API1 **[External]**: changing `/tickets/41` to `/tickets/42` in the URL is the most common real-world API breach.
+
+**Why it matters.** Every customer system you touch will have multi-tenant or per-user data. Interviewers probe whether you put the check in the right place.
+
+**How it works in this project.**
+
+```text
+ login form ─► POST /auth/token (form) ─► verify Argon2 hash ─► JWT
+              {sub, role, aud="support-desk-spa", iss, exp}
+ SPA keeps token in memory ─► GET /me ─► role used only to adapt UI
+ Every call ─► current_user() verifies signature, aud, iss, exp
+            ─► TicketService(session, user)
+                 _visible(): requester → WHERE owner = :username
+                 get(): not visible → 404 (do not reveal existence)
+                 update_status(): role != agent → 403
+```
+
+Key design decisions:
+
+- **Owner comes from the token, never the body.** The schema rejects an `owner` field (`extra="forbid"`).
+- **The filter lives in the query** (`_visible()`), so list, get, and update all inherit it. A check after loading the row is easy to forget on the next endpoint.
+- **404 vs 403:** return 404 for objects the user may not know exist; 403 when the user can see the object but not perform the action.
+- **Production identity:** an IdP (Cognito, Entra ID, Okta, Auth0) with the OIDC Authorization Code flow + PKCE **[Current]**. The API verifies the IdP's tokens against its JWKS. A backend-for-frontend (BFF) that keeps tokens server-side in an httpOnly cookie is the most secure SPA pattern for sensitive data.
+
+### 3.5 Configuration per environment
+
+**What it is.** The same code runs in dev, test, staging and prod with different settings: API URL, DB URL, allowed origins, secrets, feature flags.
+
+**Why it matters.** Config bugs are the most common "works on my machine" deploy failure.
+
+**How it works.**
+
+| Tier | Mechanism | Gotcha |
+|---|---|---|
+| Backend | `pydantic-settings`, env vars `APP_*`, `.env` in dev only | Validate at startup: a missing secret should crash the process, not the first request |
+| Frontend (Vite) | `VITE_*` variables | Inlined at **build** time. One build per environment, or fetch `/config.json` at runtime to promote the same artifact |
+| Secrets | AWS Secrets Manager / SSM, K8s Secrets (Unit 6) | Never in the SPA bundle: everything shipped to the browser is public |
+
+### 3.6 Request IDs and the error contract
+
+**What it is.** A unique ID per request (`X-Request-ID`) that the client sends or the server generates, echoes on the response, attaches to every log line and includes in error bodies.
+
+**Why it matters.** A user's screenshot with "ref 9f2c…" leads straight to the backend log lines and, with tracing (Unit 11), to the slow SQL query. Without it you are guessing from timestamps.
+
+**How it works.**
+
+- The middleware accepts the incoming ID only if it matches a safe pattern (`^[A-Za-z0-9._-]{8,64}$`), which prevents log injection; otherwise it generates one.
+- A `ContextVar` holds the ID for the duration of the request, and a logging filter stamps it on every record.
+- Errors use RFC 9457 problem details plus `request_id`, so the UI renders `detail` and shows the reference.
+- W3C Trace Context (`traceparent`) is the standard for distributed tracing; OpenTelemetry propagates it automatically (Unit 11). A request ID is the simple first step.
+
+### 3.7 The full-stack testing pyramid
+
+| Layer | Tool here | What it proves | Speed |
+|---|---|---|---|
+| Unit | pytest, Vitest | Pure logic: validation, client behavior | ms |
+| API integration | pytest + `TestClient` + in-memory SQLite | Routes, auth, SQL, error format together | ~10 ms/test |
+| Component | Testing Library + mock fetch | UI behavior against the contract | ~50 ms/test |
+| Contract | OpenAPI schema test | Fields the SPA relies on still exist | ms |
+| End to end | Playwright, both tiers running | The real browser, proxy, API and DB work together | seconds |
+
+Keep end-to-end tests few and focused on critical journeys (here: create → authorization → resolve). Push everything else down the pyramid. Playwright's `webServer` option starts the backend and frontend before the tests ([docs](https://playwright.dev/docs/test-webserver) **[Current]**).
+
+### 3.8 Deployment topology (preview of Unit 6)
+
+```text
+ Option A — same origin (recommended)
+   app.example.com ─► CloudFront ─┬─ /*      → S3 (SPA build)
+                                  └─ /api/*  → ALB → FastAPI (ECS/EKS)
+ Option B — separate origins
+   app.example.com (S3/CloudFront)   api.example.com (ALB → FastAPI)
+   → needs CORS allow-list = ["https://app.example.com"]
+```
+
+Option A gives no CORS, cookies work simply, and there is one TLS certificate and domain. Option B is fine when the API serves several clients.
+
+## 4. Application in a Real System
+
+A customer wants an internal support desk: employees file tickets, IT agents triage them. The FDE delivers it in a week:
+
+- **Day 1:** confirm roles and the visibility rule ("can employees see each other's tickets?" — no) and write it as an acceptance test before coding.
+- **Days 2–3:** API with object-level authorization and integration tests; SPA against the mock in parallel.
+- **Day 4:** switch the SPA to the real API via configuration; add the contract test; fix the two integration bugs found (CORS header, a field name).
+- **Day 5:** Playwright journey in CI, request IDs in logs, and a demo where the customer's security reviewer tries `/tickets/{someone-else's id}` and gets 404.
+
+## 5. Implementation
+
+### 5.1 Object-level authorization in the query
+
+```python
+def _visible(self) -> Select[TicketRow]:
+    stmt = select(TicketRow)
+    if self._user.role is Role.REQUESTER:
+        stmt = stmt.where(TicketRow.owner == self._user.username)
+    return stmt
+
+def get(self, ticket_id: int) -> TicketRow:
+    row = self._session.scalar(
+        self._visible().where(TicketRow.id == ticket_id)
+    )
+    if row is None:
+        # 404, not 403: don't reveal that someone else's ticket exists
+        raise NotFoundError(f"Ticket {ticket_id} not found.")
+    return row
+```
+
+`update_status` calls `get` inside its transaction, so it inherits the rule for free.
+
+### 5.2 CORS that matches the client
+
+```python
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins,   # exact origins per env
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PATCH"],
+    allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
+    expose_headers=["X-Request-ID"],       # readable by JavaScript
+)
+```
+
+### 5.3 Request ID: browser to log line
+
+```typescript
+// frontend/src/api/client.ts
+const requestId = newRequestId();          // crypto.randomUUID()
+const headers = new Headers({
+  Accept: "application/json",
+  "X-Request-ID": requestId,
+});
+// … on error:
+throw new ApiError(
+  response.status,
+  problem,
+  response.headers.get("X-Request-ID") ?? requestId,
+);
+```
+
+```python
+# backend/app/observability.py (inside the middleware)
+request_id = incoming if SAFE_ID.match(incoming) else uuid.uuid4().hex
+token = request_id_var.set(request_id)
+try:
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
+    log.info("%s %s -> %s", request.method, request.url.path,
+             response.status_code)
+    return response
+finally:
+    request_id_var.reset(token)
+```
+
+The log line looks like this:
+
+```text
+2026-10-14 15:11:26 INFO [d1f30254…] access PATCH /tickets/1 -> 200 in 4.2ms
+```
+
+### 5.4 Role from the server, UI adapts
+
+```typescript
+const login = async (user: string, password: string) => {
+  const token = await api.login(user, password);
+  tokenRef.current = token.access_token;
+  const me = await api.me();   // server says who we are
+  setRole(me.role);
+  setUsername(me.username);
+};
+// TicketList: <select disabled={!canEditStatus} …>
+```
+
+Disabling the control is UX. The 403 from the API is the security control, and a test proves it.
+
+### 5.5 A contract test the frontend can rely on
+
+```python
+def test_contract_matches_frontend_expectations(client):
+    schemas = client.get("/openapi.json").json()["components"]["schemas"]
+    ticket = set(schemas["TicketOut"]["properties"])
+    assert {"id", "title", "description", "priority", "status",
+            "created_at"} <= ticket
+```
+
+### 5.6 One Playwright journey across both tiers
+
+```typescript
+const alice = await browser.newPage();
+await signIn(alice, "alice");
+await alice.getByLabel("Title").fill(title);
+await alice.getByRole("button", { name: "Create ticket" }).click();
+
+const bob = await browser.newPage();          // separate session
+await signIn(bob, "bob");
+await expect(bob.getByText(title)).toHaveCount(0);   // BOLA check
+
+const agent = await browser.newPage();
+await signIn(agent, "agent");
+const row = agent.getByRole("row").filter({ hasText: title });
+await row.getByRole("combobox").selectOption("closed");
+```
+
+**Note on React StrictMode.** In development, React mounts effects twice to surface missing cleanups, so you will see two `GET /tickets` in the backend log on page load. That is expected in dev only, and the `AbortController` cleanup from Unit 4 handles it.
+
+## 6. How It Connects to the Rest of the System
+
+```text
+ Unit 5 full-stack slice
+   ├─ uses: Python patterns (U1), FastAPI auth/errors (U2),
+   │        SQL + transactions (U3), SPA client/state (U4)
+   ├─ packaged as 2 artifacts: API container + static SPA (U6)
+   ├─ CI runs pytest, vitest, contract and e2e tests (U7)
+   ├─ the API becomes one service among many; IDs propagate (U8)
+   ├─ AI features plug in behind the same API + auth (U9-U10)
+   ├─ request IDs grow into traces, metrics, dashboards (U11)
+   └─ the demo + acceptance tests are FDE deliverables (U12)
+```
+
+## Cross-Unit System Map — Units 1–5
+
+```text
+                    ┌──────────────────────── Browser ───────────────┐
+                    │ React SPA (U4/U5)                              │
+                    │  components → hooks → API client               │
+                    │  token in memory · X-Request-ID · problem UI   │
+                    └───────────────┬────────────────────────────────┘
+                                    │ HTTPS  JSON  Bearer JWT
+                    ┌───────────────▼────────────────────────────────┐
+                    │ FastAPI (U2/U5)                                │
+                    │  CORS → RequestId → validation (Pydantic)      │
+                    │  Depends: session, current_user, service       │
+                    │  errors → RFC 9457 problem+json                │
+                    ├────────────────────────────────────────────────┤
+                    │ Service layer (U1 patterns: typed, testable)   │
+                    │  roles · object-level authz · transactions     │
+                    │  async fan-out with timeouts + retries (U1)    │
+                    ├───────────────┬───────────────┬────────────────┤
+                    │ SQLAlchemy    │ Cache (U3)    │ External APIs  │
+                    │ Postgres (U3) │ Redis aside   │ (U1 retry)     │
+                    └───────────────┴───────────────┴────────────────┘
+  Tests: pytest unit/integration · Vitest/RTL · contract · Playwright
+  Deterministic everywhere so far: same input → same output.
+  (Units 9-10 add probabilistic components behind this same boundary.)
+```
+
+**How to use this map in an interview.** When asked "design a small internal tool", draw these boxes in this order, then say where authentication, authorization, validation, transactions, and logging live. That alone shows end-to-end ownership.
+
+## FDE Scenario 4 — "Our security team found that users can see other people's tickets"
+
+**Stakeholder (customer CISO, urgent):** "During a review, one of our people changed the number in the URL and saw another employee's HR ticket. We need this fixed today and we need to know who was affected."
+
+- *Stay calm and scope:* acknowledge, confirm the exact reproduction (URL, user, time), and agree on a communication cadence (updates every 2 hours).
+- *Investigate:*
+  - reproduce with two test users;
+  - read the endpoint: does `GET /tickets/{id}` filter by owner, or just by ID?
+  - check every endpoint that takes an ID (GET, PATCH, attachments, exports): BOLA is rarely in just one place.
+- *Contain:* ship the minimal fix first: the owner filter in a shared query function, 404 for non-owners, plus tests for each endpoint. Deploy it behind the normal pipeline, not by hand.
+- *Assess impact:* use request IDs and access logs to find requests where `user != ticket.owner` for the affected endpoints. Give the customer a factual list, not a guess.
+- *What must be deterministic:* authorization. Never "the UI hides it."
+- *Prevent:* an authorization test matrix (role × endpoint × own/other's object) in CI; code review checklist item; consider row-level security in Postgres as defense in depth.
+- *Communicate:* a short written incident summary: what happened, impact, fix, verification, and prevention. Separate facts from hypotheses.
+
+## Comprehension Questions
+
+1. List, in order, the layers a "close ticket" click passes through before a row changes in the database.
+2. Why does a CORS error appear in the browser but never in curl?
+3. What does `expose_headers` do, and why does this project need it?
+4. Why must the ticket owner come from the token rather than the request body?
+5. Why put the visibility filter inside the query instead of checking after loading the row?
+6. When do you return 404 instead of 403?
+7. Why are `VITE_*` variables a problem for "build once, deploy everywhere"?
+8. What does a request ID give you that timestamps alone do not?
+
+## Comprehension Answers
+
+1. Component event → state/hook → API client (headers) → network/proxy → middleware (request ID, CORS) → validation → dependencies (session, JWT verification) → service rules (role, visibility) → SQL transaction → serialization → response → UI state.
+2. CORS is enforced by browsers to protect users. curl is not a browser, so it ignores CORS and simply shows the response.
+3. Browsers only let JavaScript read a few "safe" response headers. `expose_headers` adds others; the SPA needs to read `X-Request-ID` to show it on errors.
+4. The body is controlled by the client, so anyone could file tickets as someone else. The token is signed by the server and identifies the caller.
+5. Every code path that uses the query (list, get, update, export) inherits the rule automatically. A post-load check must be remembered in each endpoint, and forgetting one is a data leak.
+6. When the user is not allowed to know the object exists (another user's ticket). Use 403 when they can see it but may not perform the action.
+7. Vite inlines them at build time, so each environment needs its own build. Use runtime config (`/config.json`) or a same-origin `/api` path to promote one artifact.
+8. An exact join key across browser, proxy, API logs and traces, even with concurrent requests and clock skew.
+
+## Interview Questions — Theory-Based
+
+**Q1. Walk me through what happens when a user submits a form in your SPA until the data is saved.**
+
+- *Strong answer:* walk the lifecycle from §3.1 and name a failure mode at each step: client validation, the request with auth and request-ID headers, DNS/TLS/proxy, the CORS preflight if cross-origin, middleware, Pydantic validation (422), the JWT dependency (401), role and object checks (403/404), the transaction (409 on conflict), serialization, then UI state update or a problem+json message.
+- *What it tests:* end-to-end understanding and debugging instinct.
+- *Follow-up:* "Where would you look first if it takes 5 seconds?" (Browser Network timing to split client vs server time, then server logs and traces by request ID, then SQL.)
+
+**Q2. What is CORS and how do you configure it correctly?**
+
+- *Strong answer:* a browser rule that blocks reading cross-origin responses unless the server opts in. Preflight `OPTIONS` for non-simple requests. Configure exact origins per environment, the headers you send, `expose_headers` for those you read, never `*` with credentials. Prefer same origin via a proxy or CDN routing. CORS is not authentication.
+- *Follow-up:* "Postman works but the browser fails — why?" (Postman ignores CORS.)
+
+**Q3. What is BOLA/IDOR and how do you prevent it?**
+
+- *Strong answer:* Broken Object Level Authorization: the API checks that you are logged in but not that the object belongs to you. Prevent it by scoping queries by owner or tenant in one shared place, deriving ownership from the token, returning 404 for invisible objects, testing a role × object matrix, and optionally Postgres row-level security as defense in depth.
+- *What it tests:* security awareness for customer data.
+
+**Q4. How do you keep frontend and backend in sync?**
+
+- *Strong answer:* OpenAPI as the contract, generated TypeScript types, a contract test in CI, additive-only changes with expand-and-contract for breaking ones, and versioning when clients cannot upgrade together.
+
+**Q5. Where should a SPA keep its access token?**
+
+- *Strong answer:* in memory for most SPAs (lost on refresh, mitigated by a silent refresh via the IdP). Not `localStorage` for sensitive apps (XSS-readable). The strongest pattern is a BFF: the server holds tokens and gives the browser an httpOnly, Secure, SameSite cookie, with CSRF protection.
+
+**Q6. How do you design end-to-end tests that are not flaky?**
+
+- *Strong answer:* few tests on critical journeys; fresh data per run (in-memory DB or unique names); role and label locators instead of CSS selectors; Playwright auto-waiting and web-first assertions instead of sleeps; traces on failure; no dependence on test order.
+
+**Q7. How do you configure the same app for several environments?**
+
+- *Strong answer:* env vars validated at startup for the backend; secrets from a secret manager; for the SPA, either a build per environment or runtime config; and a same-origin `/api` path so the frontend needs almost no config.
+
+## Interview Questions — Application / Experience-Based
+
+**A1. Tell me about a feature you delivered end to end.**
+
+- *Cover:* the user need, the contract you defined, backend and frontend pieces, auth, testing layers, deployment, and one integration problem you hit.
+- *Structure:* situation → contract and design → build → integration issue → verification → result.
+- *Personalize:* "`<<personalize: feature, users>>`. I defined the API contract first, `<<backend stack>>` with `<<authz approach>>`, and `<<frontend>>`. The hardest part was `<<integration issue>>`. Result: `<<metric>>`."
+- *Lab-honest version:* "In a project I built a support desk with a React SPA and FastAPI: JWT login, per-user visibility enforced in SQL, request IDs from browser to logs, and a Playwright journey that runs both tiers."
+- *Follow-ups:* "How did you test authorization?" "What broke when you connected the two tiers?"
+
+**A2. Describe a time you debugged an issue that spanned frontend and backend.**
+
+- *Cover:* the symptom, how you split the problem (Network tab, request IDs, logs), root cause, fix, regression test.
+
+**A3. How have you handled authentication and authorization in a full-stack app?**
+
+- *Cover:* IdP or local, token flow, where tokens live, how the API verifies them, role and object rules, and tests for both.
+
+**A4. How do you work when frontend and backend are built by different people or teams?**
+
+- *Cover:* contract first, mock server, generated types, contract tests, versioning, a shared Slack channel and changelog.
+
+**A5. Tell me about a time a deploy broke the UI.**
+
+- *Honest framing if you have none:* "I haven't caused one in production, but here is how I prevent it: contract tests, additive changes, a smoke test after deploy, and the ability to roll back the frontend artifact independently."
+
+## Troubleshooting Scenarios
+
+**T1. The browser console shows a CORS error on POST, but GET works.**
+
+```text
+SYMPTOM     GET ok; POST blocked "No 'Access-Control-Allow-Origin'"
+CHECK       DevTools: is there an OPTIONS preflight? its status/headers?
+            backend allow_methods / allow_headers include POST,
+            Content-Type, Authorization?
+CAUSES      preflight rejected (header not allowed); exception before
+            CORS middleware adds headers; origin not in allow-list
+CONFIRM     curl -i -X OPTIONS -H "Origin: …" -H
+            "Access-Control-Request-Method: POST" …
+FIX         allow the method/header; correct origin per environment;
+            or route through same-origin proxy
+PREVENTION  test_cors_preflight_allows_spa_origin in CI
+```
+
+**T2. Users see an error but support cannot find it in the logs.**
+
+```text
+SYMPTOM     screenshot "Something went wrong", no matching log line
+CHECK       does the UI show a request ID? does the API echo it?
+            do log lines contain it? is the request reaching the API
+            at all (load balancer logs)?
+CAUSES      no correlation ID; error happened in the proxy/LB; logs
+            sampled or at the wrong level
+FIX         X-Request-ID end to end; show "ref <id>" in error UI;
+            include request_id in problem+json
+PREVENTION  test that error bodies carry request_id
+```
+
+**T3. One user sees another user's data.**
+
+```text
+SYMPTOM     data from another account visible
+CHECK       endpoint query: filtered by owner/tenant? ID from URL
+            trusted? caching keyed without user? (CDN, Redis)
+CAUSES      missing object-level authz; cache key lacks user/tenant;
+            frontend state not cleared on logout
+CONFIRM     two test users, same ID; check cache keys
+FIX         scope queries centrally; 404 for invisible objects;
+            per-user cache keys; Cache-Control: private
+PREVENTION  authz test matrix; security review checklist
+```
+
+**T4. The UI breaks after a backend deploy: fields show "undefined".**
+
+```text
+CHECK       Network response vs TS types; recent API diff
+CAUSES      renamed/removed field; enum value changed
+FIX         restore field (expand-and-contract); regenerate types
+PREVENTION  contract test + generated types fail CI first
+```
+
+**T5. Login works locally but fails in staging with 401 on every call.**
+
+```text
+CHECK       token aud/iss vs API config in staging; clock skew;
+            proxy stripping Authorization header; different secret
+            per replica
+FIX         align APP_JWT_AUDIENCE/ISSUER; share secret/JWKS; forward
+            Authorization at the proxy
+```
+
+**T6. The Playwright test passes locally but fails in CI.**
+
+```text
+CHECK       trace viewer (trace: retain-on-failure); webServer logs;
+            leftover state from a previous test; timing assumptions
+CAUSES      shared DB between runs; hard-coded waits; port already used
+FIX         fresh DB per run; web-first assertions; reuseExistingServer
+            false in CI; unique test data
+```
+
+## Unit Practice Project — Support Desk (Full Stack)
+
+### Project Goal
+
+Connect the Unit 4 SPA to a real FastAPI + SQL backend and make the integration production-shaped:
+
+- employees (requesters) file tickets and see only their own;
+- agents see all tickets and change status;
+- request IDs connect browser errors to backend logs;
+- a contract test and Playwright end-to-end tests protect the integration.
+
+### Architecture
+
+```text
+ frontend/ (Vite :5173)                    backend/ (uvicorn :8000)
+  AuthProvider ─ login → /auth/token        main.py create_app()
+              └ /me → role                   ├ CORSMiddleware
+  useTickets → ticketsApi → client           ├ RequestIdMiddleware
+     X-Request-ID, Bearer ──/api proxy──►    ├ /auth/token  /me
+  TicketList (status disabled unless agent)  ├ /tickets GET POST
+                                             └ /tickets/{id} GET PATCH
+  e2e/ Playwright starts both servers        services.TicketService
+                                              └ _visible(): owner filter
+                                             db.py SQLAlchemy (SQLite/PG)
+```
+
+### Requirements
+
+1. `POST /auth/token` returns a JWT with `sub`, `role`, `aud`, `iss`, `exp`. `GET /me` returns username and role.
+2. `GET /tickets?status=&limit=&offset=` lists visible tickets, newest first, with `total`.
+3. `POST /tickets` creates a ticket owned by the caller. A body containing `owner` is rejected (422).
+4. Requesters only see their own tickets. Another user's ticket returns **404**.
+5. Only agents can `PATCH /tickets/{id}`; requesters get **403**.
+6. Every response has `X-Request-ID`. A well-formed client ID is echoed; a malformed one is replaced. Error bodies include `request_id`.
+7. CORS allows only configured origins and exposes `X-Request-ID`.
+8. The SPA sends a request ID on every call, shows "ref …" on action errors, loads the role from `/me`, and disables status changes for requesters.
+9. A contract test fails if `TicketOut` or `TicketCreate` change in a way the SPA depends on.
+10. Playwright covers: requester creates → other requester cannot see → agent closes → requester sees the closed ticket; plus a request-ID round trip.
+
+### Technical Requirements
+
+- Backend: Python 3.12+, FastAPI, SQLAlchemy 2.1, PyJWT, pwdlib (Argon2), pydantic-settings; SQLite by default, Postgres-ready.
+- Frontend: Node 22.12+, React 19, Vite 8, TypeScript strict, Vitest.
+- E2E: `@playwright/test` with `webServer` for both tiers.
+
+### Project Structure
+
+```text
+solution/
+├── backend/
+│   ├── app/
+│   │   ├── __init__.py
+│   │   ├── config.py
+│   │   ├── db.py
+│   │   ├── errors.py
+│   │   ├── main.py
+│   │   ├── observability.py
+│   │   ├── schemas.py
+│   │   ├── security.py
+│   │   └── services.py
+│   ├── tests/
+│   │   ├── __init__.py
+│   │   ├── conftest.py
+│   │   ├── test_cross_cutting.py
+│   │   └── test_tickets_api.py
+│   ├── .env.example
+│   ├── pyproject.toml
+│   ├── requirements-dev.txt
+│   └── requirements.txt
+├── frontend/
+│   ├── e2e/
+│   │   └── tickets.e2e.ts
+│   ├── src/
+│   │   ├── api/
+│   │   │   ├── client.test.ts
+│   │   │   ├── client.ts
+│   │   │   ├── mockServer.ts
+│   │   │   ├── tickets.ts
+│   │   │   └── types.ts
+│   │   ├── auth/
+│   │   │   ├── AuthContext.tsx
+│   │   │   └── ProtectedRoute.tsx
+│   │   ├── components/
+│   │   │   ├── TicketForm.test.tsx
+│   │   │   ├── TicketForm.tsx
+│   │   │   └── TicketList.tsx
+│   │   ├── hooks/
+│   │   │   └── useTickets.ts
+│   │   ├── pages/
+│   │   │   ├── LoginPage.tsx
+│   │   │   └── TicketsPage.tsx
+│   │   ├── test/
+│   │   │   └── setup.ts
+│   │   ├── App.test.tsx
+│   │   ├── App.tsx
+│   │   ├── main.tsx
+│   │   ├── styles.css
+│   │   └── vite-env.d.ts
+│   ├── .env.example
+│   ├── .prettierrc.json
+│   ├── README.md
+│   ├── index.html
+│   ├── package.json
+│   ├── playwright.config.ts
+│   ├── tsconfig.json
+│   └── vite.config.ts
+└── README.md
+```
+
+
+### Step-by-Step Implementation
+
+1. **Run both tiers from the starter.** Backend: `uvicorn app.main:create_app --factory --reload`. Frontend: `npm run dev`. Sign in as alice.
+   - *Why:* see the baseline: everything "works", but alice can see bob's tickets and change status.
+2. **TODO 1–2: authorization in `TicketService`.**
+   - *Test:* `pytest -q tests/test_tickets_api.py`.
+3. **TODO 4: `GET /me`.**
+   - *Test:* `pytest -q -k me`.
+4. **TODO 5: request-ID middleware.**
+   - *Test:* `pytest -q tests/test_cross_cutting.py -k request_id`; watch the uvicorn log show `[<id>]`.
+5. **TODO 3: CORS.** Set `VITE_API_BASE_URL=http://127.0.0.1:8000` to call cross-origin and watch the preflight in DevTools.
+   - *Test:* `pytest -q -k cors`.
+6. **TODO 6–7: send and surface the request ID in the client.**
+   - *Test:* `npx vitest run src/api/client.test.ts`.
+7. **TODO 8–9: role from `/me`, read-only status for requesters.**
+   - *Test:* `npm test`.
+8. **TODO 10: end to end.** Remove `.fixme`, run `npm run e2e`.
+9. **Finish:** `pytest -q && ruff check . && mypy`, then `npm test && npm run typecheck`.
+
+### Starter Code
+
+**File: `backend/app/services.py`**
+
+```python
+"""Ticket rules, including object-level authorization."""
+
+from __future__ import annotations
+
+from sqlalchemy import Select, func, select
+from sqlalchemy.orm import Session
+
+from app.db import TicketRow
+from app.errors import ForbiddenError, NotFoundError  # noqa: F401
+from app.schemas import Role, TicketCreate, TicketStatus, User  # noqa: F401
+
+
+class TicketService:
+    def __init__(self, session: Session, user: User) -> None:
+        self._session = session
+        self._user = user
+
+    def _visible(self) -> Select[TicketRow]:
+        """Requesters only ever see their own tickets: the filter is
+        part of the query, so other rows can never leak."""
+        # TODO(1): requesters must only see rows they own. Add the filter
+        # HERE (in the query), so list/get/update all inherit it.
+        return select(TicketRow)
+
+    def list(
+        self, status: TicketStatus | None, limit: int, offset: int
+    ) -> tuple[list[TicketRow], int]:
+        stmt = self._visible()
+        if status is not None:
+            stmt = stmt.where(TicketRow.status == status.value)
+        total = self._session.scalar(
+            select(func.count()).select_from(stmt.subquery())
+        )
+        rows = self._session.scalars(
+            stmt.order_by(TicketRow.id.desc()).limit(limit).offset(offset)
+        ).all()
+        return list(rows), int(total or 0)
+
+    def get(self, ticket_id: int) -> TicketRow:
+        row = self._session.scalar(
+            self._visible().where(TicketRow.id == ticket_id)
+        )
+        if row is None:
+            # 404, not 403: don't reveal that someone else's ticket exists
+            raise NotFoundError(f"Ticket {ticket_id} not found.")
+        return row
+
+    def create(self, data: TicketCreate) -> TicketRow:
+        row = TicketRow(
+            title=data.title,
+            description=data.description,
+            priority=data.priority.value,
+            owner=self._user.username,  # from the token, never the body
+        )
+        with self._session.begin():
+            self._session.add(row)
+        return row
+
+    def update_status(
+        self, ticket_id: int, status: TicketStatus
+    ) -> TicketRow:
+        # TODO(2): only agents may change status -> raise ForbiddenError.
+        with self._session.begin():
+            row = self.get(ticket_id)
+            row.status = status.value
+        return row
+```
+
+
+**File: `backend/app/observability.py`**
+
+```python
+"""Request IDs: one ID follows a request from browser to logs."""
+
+from __future__ import annotations
+
+import logging
+import re
+import time
+import uuid
+from contextvars import ContextVar
+
+from starlette.middleware.base import (
+    BaseHTTPMiddleware,
+    RequestResponseEndpoint,
+)
+from starlette.requests import Request
+from starlette.responses import Response
+
+request_id_var: ContextVar[str] = ContextVar("request_id", default="-")
+SAFE_ID = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+log = logging.getLogger("access")
+
+
+class RequestIdFilter(logging.Filter):
+    """Adds request_id to every log record emitted during a request."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.request_id = request_id_var.get()
+        return True
+
+
+def configure_logging() -> None:
+    handler = logging.StreamHandler()
+    handler.addFilter(RequestIdFilter())
+    handler.setFormatter(
+        logging.Formatter(
+            "%(asctime)s %(levelname)s [%(request_id)s] %(name)s "
+            "%(message)s"
+        )
+    )
+    root = logging.getLogger()
+    root.handlers[:] = [handler]
+    root.setLevel(logging.INFO)
+
+
+class RequestIdMiddleware(BaseHTTPMiddleware):
+    async def dispatch(
+        self, request: Request, call_next: RequestResponseEndpoint
+    ) -> Response:
+        # TODO(5): read X-Request-ID; keep it only if SAFE_ID matches
+        # (prevents log injection), else uuid.uuid4().hex. Set
+        # request_id_var for the duration of the request, put the ID on
+        # the response header, log one access line, reset the var.
+        _ = (uuid, time, SAFE_ID, request_id_var)
+        return await call_next(request)
+```
+
+
+The starter also has TODOs in `backend/app/main.py` (CORS, `/me`), `frontend/src/api/client.ts` (send and surface the request ID), `frontend/src/auth/AuthContext.tsx` (`/me`), `frontend/src/components/TicketList.tsx` (read-only status) and `frontend/e2e/tickets.e2e.ts`. The task table is in the starter `README.md`.
+
+### Practice Tasks
+
+1. **Normal behavior:** both roles, create, filter, close.
+2. **Validation:** short title, `owner` in the body, unknown status value, `limit=1000`.
+3. **Errors:**
+   - expired or tampered token → 401 and back to login;
+   - backend stopped → "Network error" in the UI;
+   - a 403 shows a message with "ref …".
+4. **Security edge cases:**
+   - requester guesses IDs with GET and PATCH;
+   - forged `X-Request-ID` containing a newline;
+   - an origin not in the allow-list.
+5. **Extend:**
+   - add `GET /tickets/{id}` detail page in the SPA;
+   - make agents' updates record `updated_by` from the token;
+   - generate TS types with `openapi-typescript` and replace `types.ts`.
+
+### Hints
+
+1. In `_visible()`, return a `Select` and let callers add `.where(...)`, `.order_by(...)` and so on.
+2. `get()` already raises `NotFoundError` when the row is missing; with the filter, "not yours" becomes "missing" automatically.
+3. For the middleware, set the `ContextVar` before `call_next` and reset it in `finally`; log *before* the reset so the filter sees the ID.
+4. Starlette adds CORS headers only to responses that pass through `CORSMiddleware`; register it with `add_middleware`, and check it with an `OPTIONS` request in a test.
+5. In the client, the server's `X-Request-ID` header is authoritative if the server replaced yours.
+6. In Playwright, `browser.newPage()` creates an isolated context per user, so three users can be signed in at once.
+
+### Expected Behavior
+
+```text
+alice: POST /tickets {"title":"Printer jam"}  → 201 owner=alice
+alice: POST /tickets {"title":"x","owner":"bob"} → 422
+bob:   GET /tickets/1                        → 404 problem+json
+alice: PATCH /tickets/1 {"status":"closed"}  → 403 "Only agents…"
+agent: PATCH /tickets/1 {"status":"closed"}  → 200 status=closed
+GET /health  X-Request-ID: abc-123           → X-Request-ID: abc-123
+GET /health  X-Request-ID: "bad\nid"         → new 32-hex ID
+OPTIONS /tickets Origin: https://evil.example → no ACAO header
+SPA alice: status dropdown disabled; agent: enabled
+```
+
+### Testing Requirements
+
+- **Backend integration (13):** owner from token, visibility and 404, agent-only PATCH, status filter, validation problem details, `/me`, 401, request-ID echo/replace/in-error, CORS allowed/rejected, contract.
+- **Frontend (17):** Unit 4 tests plus request-ID client test and requester read-only view.
+- **E2E (2):** the multi-user journey and the request-ID round trip.
+
+```bash
+cd backend && pytest -q && ruff check . && mypy
+cd frontend && npm test && npm run typecheck
+cd frontend && PYTHON=../backend/.venv/bin/python npm run e2e
+```
+
+### Final Runnable Solution
+
+**File: `README.md`**
+
+````markdown
+# Unit 5 Project — Support Desk (React SPA + FastAPI + SQL)
+
+The Unit 4 SPA connected to a real FastAPI backend. Covers JWT login,
+`/me` for the role, object-level authorization (requesters only see
+their own tickets; only agents change status), CORS, request IDs that
+connect browser and server logs, problem+json errors, a contract test,
+and Playwright end-to-end tests that start both tiers.
+
+```
+browser ─► Vite :5173 ─/api proxy─► FastAPI :8000 ─► SQLite/Postgres
+X-Request-ID: 9f2c…        log: [9f2c…] PATCH /tickets/1 -> 200
+```
+
+## Run the backend
+
+```bash
+cd backend
+python3.12 -m venv .venv && source .venv/bin/activate
+pip install -r requirements-dev.txt
+cp .env.example .env
+uvicorn app.main:create_app --factory --reload  # :8000/docs
+pytest -q && ruff check . && mypy
+```
+
+## Run the frontend (second terminal)
+
+```bash
+cd frontend
+npm install
+cp .env.example .env        # real backend through the /api proxy
+npm run dev                 # http://localhost:5173
+npm test && npm run typecheck
+```
+
+Demo users: `agent / agent-password` (agent),
+`alice / alice-password` and `bob / bob-password` (requesters).
+
+## End-to-end tests
+
+```bash
+cd frontend
+npx playwright install chromium          # once
+PYTHON=../backend/.venv/bin/python npm run e2e
+```
+
+Playwright starts uvicorn (fresh in-memory DB) and Vite, then drives
+three browser sessions: alice creates a ticket, bob cannot see it,
+the agent closes it. Set `PW_CHROMIUM_PATH` to use a pre-installed
+browser instead of downloading one.
+
+## Verify by hand
+
+1. Sign in as alice, create a ticket: the status dropdown is disabled.
+2. Sign in as bob in a private window: alice's ticket is not listed.
+3. `curl -i 127.0.0.1:8000/tickets/1 -H "Authorization: Bearer $BOB"`
+   (with bob's token in `$BOB`) returns **404**, not 403: we do not
+   reveal that the ticket exists.
+4. In DevTools > Network, copy a request's `X-Request-ID`, then find
+   the same ID in the uvicorn log line for that request.
+````
+
+**File: `frontend/README.md`**
+
+```markdown
+# Support Desk SPA (Unit 5)
+
+The Unit 4 SPA, now talking to the real FastAPI backend by default.
+See `../README.md` for how to run both tiers and the e2e tests.
+Set `VITE_USE_MOCK=true` in `.env` to work without the backend.
+```
+
+**File: `backend/.env.example`**
+
+```bash
+APP_ENV=dev
+APP_JWT_SECRET=change-me-to-a-long-random-string-of-32-plus-chars
+APP_DATABASE_URL=sqlite:///./support.db
+APP_CORS_ORIGINS=["http://localhost:5173","http://127.0.0.1:5173"]
+# user:password:role, comma-separated (quoted value may span lines)
+APP_DEMO_USERS="agent:agent-password:agent,
+  alice:alice-password:requester,
+  bob:bob-password:requester"
+```
+
+**File: `backend/app/__init__.py`**
+
+```python
+
+```
+
+**File: `backend/app/config.py`**
+
+```python
+from __future__ import annotations
+
+from functools import lru_cache
+from typing import Literal
+
+from pydantic import Field, SecretStr
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="APP_", env_file=".env", extra="ignore"
+    )
+
+    env: Literal["dev", "test", "prod"] = "dev"
+    jwt_secret: SecretStr = Field(min_length=32)
+    jwt_issuer: str = "support-desk"
+    jwt_audience: str = "support-desk-spa"
+    access_token_minutes: int = 30
+    database_url: str = "sqlite:///./support.db"
+    # Exact origins only: "*" plus credentials is rejected by browsers
+    # and would be unsafe.
+    cors_origins: list[str] = ["http://localhost:5173"]
+    demo_users: str = ""
+
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()
+```
+
+**File: `backend/app/db.py`**
+
+```python
+from __future__ import annotations
+
+from collections.abc import Iterator
+from datetime import UTC, datetime
+
+from sqlalchemy import (
+    DateTime,
+    ForeignKey,
+    Index,
+    String,
+    Text,
+    create_engine,
+)
+from sqlalchemy.engine import Engine
+from sqlalchemy.orm import (
+    DeclarativeBase,
+    Mapped,
+    Session,
+    mapped_column,
+    sessionmaker,
+)
+from sqlalchemy.pool import StaticPool
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class UserRow(Base):
+    __tablename__ = "users"
+    username: Mapped[str] = mapped_column(String(50), primary_key=True)
+    password_hash: Mapped[str] = mapped_column(String(200))
+    role: Mapped[str] = mapped_column(String(20))
+
+
+class TicketRow(Base):
+    __tablename__ = "tickets"
+    __table_args__ = (Index("ix_tickets_owner_status", "owner", "status"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str] = mapped_column(String(120))
+    description: Mapped[str] = mapped_column(Text, default="")
+    priority: Mapped[str] = mapped_column(String(10))
+    status: Mapped[str] = mapped_column(String(20), default="open")
+    owner: Mapped[str] = mapped_column(ForeignKey("users.username"))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC)
+    )
+
+
+def make_engine(url: str) -> Engine:
+    if url.startswith("sqlite"):
+        extra = {"poolclass": StaticPool} if url == "sqlite://" else {}
+        return create_engine(
+            url, connect_args={"check_same_thread": False}, **extra
+        )
+    return create_engine(url, pool_pre_ping=True)
+
+
+def session_scope(factory: sessionmaker[Session]) -> Iterator[Session]:
+    session = factory()
+    try:
+        yield session
+    finally:
+        session.close()
+```
+
+**File: `backend/app/errors.py`**
+
+```python
+from __future__ import annotations
+
+import logging
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+
+from app.observability import request_id_var
+
+log = logging.getLogger(__name__)
+
+
+class DomainError(Exception):
+    status_code = 400
+    title = "Bad request"
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(detail)
+        self.detail = detail
+
+
+class NotFoundError(DomainError):
+    status_code = 404
+    title = "Not found"
+
+
+class ForbiddenError(DomainError):
+    status_code = 403
+    title = "Forbidden"
+
+
+def problem(
+    status: int, title: str, detail: str, **extra: object
+) -> JSONResponse:
+    # request_id lets the UI show "reference abc123" so support can
+    # find the exact log lines for a user's failed request.
+    body = {
+        "title": title,
+        "status": status,
+        "detail": detail,
+        "request_id": request_id_var.get(),
+        **extra,
+    }
+    return JSONResponse(body, status, media_type="application/problem+json")
+
+
+def register_error_handlers(app: FastAPI) -> None:
+    @app.exception_handler(DomainError)
+    async def domain(_: Request, exc: DomainError) -> JSONResponse:
+        return problem(exc.status_code, exc.title, exc.detail)
+
+    @app.exception_handler(HTTPException)
+    async def http(_: Request, exc: HTTPException) -> JSONResponse:
+        response = problem(
+            exc.status_code, "Request failed", str(exc.detail)
+        )
+        if exc.headers:
+            response.headers.update(exc.headers)
+        return response
+
+    @app.exception_handler(RequestValidationError)
+    async def validation(
+        _: Request, exc: RequestValidationError
+    ) -> JSONResponse:
+        errors = [
+            {"loc": list(e["loc"]), "msg": e["msg"]} for e in exc.errors()
+        ]
+        return problem(
+            422,
+            "Validation failed",
+            "The request is invalid.",
+            errors=errors,
+        )
+
+    @app.exception_handler(Exception)
+    async def unhandled(request: Request, exc: Exception) -> JSONResponse:
+        log.exception("unhandled error on %s", request.url.path)
+        return problem(500, "Internal server error", "Unexpected error.")
+```
+
+**File: `backend/app/main.py`**
+
+```python
+"""Support Desk API. Run: uvicorn app.main:create_app --factory --reload"""
+
+# No `from __future__ import annotations` here: FastAPI must resolve the
+# Annotated dependency aliases defined inside create_app at runtime.
+
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager
+from typing import Annotated
+
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from sqlalchemy import select, text
+from sqlalchemy.orm import Session, sessionmaker
+
+from app.config import Settings, get_settings
+from app.db import Base, UserRow, make_engine, session_scope
+from app.errors import register_error_handlers
+from app.observability import RequestIdMiddleware, configure_logging
+from app.schemas import (
+    Role,
+    TicketCreate,
+    TicketOut,
+    TicketPage,
+    TicketStatus,
+    TicketStatusUpdate,
+    Token,
+    User,
+)
+from app.security import (
+    InvalidTokenError,
+    create_access_token,
+    decode_access_token,
+    hasher,
+)
+from app.services import TicketService
+
+oauth2 = OAuth2PasswordBearer(tokenUrl="/auth/token")
+
+
+def seed_users(factory: sessionmaker[Session], spec: str) -> None:
+    with factory.begin() as session:
+        for item in filter(None, (s.strip() for s in spec.split(","))):
+            username, password, role = item.split(":")
+            if session.get(UserRow, username) is None:
+                session.add(
+                    UserRow(
+                        username=username,
+                        password_hash=hasher.hash(password),
+                        role=Role(role).value,
+                    )
+                )
+
+
+def create_app(settings: Settings | None = None) -> FastAPI:
+    settings = settings or get_settings()
+    configure_logging()
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        engine = make_engine(settings.database_url)
+        Base.metadata.create_all(engine)  # dev/demo; prod uses Alembic
+        factory = sessionmaker(engine, expire_on_commit=False)
+        if settings.env != "prod":
+            seed_users(factory, settings.demo_users)
+        app.state.session_factory = factory
+        yield
+        engine.dispose()
+
+    app = FastAPI(
+        title="Support Desk API", version="1.0.0", lifespan=lifespan
+    )
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.cors_origins,
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "PATCH"],
+        allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
+        expose_headers=["X-Request-ID"],
+    )
+    app.add_middleware(RequestIdMiddleware)
+    register_error_handlers(app)
+
+    def get_session(request: Request) -> Iterator[Session]:
+        yield from session_scope(request.app.state.session_factory)
+
+    SessionDep = Annotated[Session, Depends(get_session)]
+
+    def current_user(token: Annotated[str, Depends(oauth2)]) -> User:
+        try:
+            return decode_access_token(token, settings)
+        except InvalidTokenError as exc:
+            raise HTTPException(
+                401,
+                "Invalid or expired token",
+                headers={"WWW-Authenticate": "Bearer"},
+            ) from exc
+
+    UserDep = Annotated[User, Depends(current_user)]
+
+    def tickets(session: SessionDep, user: UserDep) -> TicketService:
+        return TicketService(session, user)
+
+    TicketsDep = Annotated[TicketService, Depends(tickets)]
+
+    @app.get("/health", tags=["ops"])
+    def health(session: SessionDep) -> dict[str, str]:
+        session.execute(text("SELECT 1"))
+        return {"status": "ok"}
+
+    @app.post("/auth/token", tags=["auth"])
+    def login(
+        form: Annotated[OAuth2PasswordRequestForm, Depends()],
+        session: SessionDep,
+    ) -> Token:
+        row = session.scalar(
+            select(UserRow).where(UserRow.username == form.username)
+        )
+        if row is None or not hasher.verify(
+            form.password, row.password_hash
+        ):
+            raise HTTPException(
+                401,
+                "Incorrect username or password",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        user = User(username=row.username, role=Role(row.role))
+        return Token(
+            access_token=create_access_token(user, settings),
+            expires_in=settings.access_token_minutes * 60,
+        )
+
+    @app.get("/me", tags=["auth"])
+    def me(user: UserDep) -> User:
+        return user
+
+    @app.get("/tickets", tags=["tickets"])
+    def list_tickets(
+        service: TicketsDep,
+        status_: Annotated[
+            TicketStatus | None, Query(alias="status")
+        ] = None,
+        limit: Annotated[int, Query(ge=1, le=100)] = 50,
+        offset: Annotated[int, Query(ge=0)] = 0,
+    ) -> TicketPage:
+        rows, total = service.list(status_, limit, offset)
+        return TicketPage(
+            items=[TicketOut.model_validate(r) for r in rows], total=total
+        )
+
+    @app.post(
+        "/tickets", status_code=status.HTTP_201_CREATED, tags=["tickets"]
+    )
+    def create_ticket(body: TicketCreate, service: TicketsDep) -> TicketOut:
+        return TicketOut.model_validate(service.create(body))
+
+    @app.get("/tickets/{ticket_id}", tags=["tickets"])
+    def get_ticket(ticket_id: int, service: TicketsDep) -> TicketOut:
+        return TicketOut.model_validate(service.get(ticket_id))
+
+    @app.patch("/tickets/{ticket_id}", tags=["tickets"])
+    def update_ticket(
+        ticket_id: int, body: TicketStatusUpdate, service: TicketsDep
+    ) -> TicketOut:
+        return TicketOut.model_validate(
+            service.update_status(ticket_id, body.status)
+        )
+
+    return app
+```
+
+**File: `backend/app/observability.py`**
+
+```python
+"""Request IDs: one ID follows a request from browser to logs."""
+
+from __future__ import annotations
+
+import logging
+import re
+import time
+import uuid
+from contextvars import ContextVar
+
+from starlette.middleware.base import (
+    BaseHTTPMiddleware,
+    RequestResponseEndpoint,
+)
+from starlette.requests import Request
+from starlette.responses import Response
+
+request_id_var: ContextVar[str] = ContextVar("request_id", default="-")
+SAFE_ID = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+log = logging.getLogger("access")
+
+
+class RequestIdFilter(logging.Filter):
+    """Adds request_id to every log record emitted during a request."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.request_id = request_id_var.get()
+        return True
+
+
+def configure_logging() -> None:
+    handler = logging.StreamHandler()
+    handler.addFilter(RequestIdFilter())
+    handler.setFormatter(
+        logging.Formatter(
+            "%(asctime)s %(levelname)s [%(request_id)s] %(name)s "
+            "%(message)s"
+        )
+    )
+    root = logging.getLogger()
+    root.handlers[:] = [handler]
+    root.setLevel(logging.INFO)
+
+
+class RequestIdMiddleware(BaseHTTPMiddleware):
+    async def dispatch(
+        self, request: Request, call_next: RequestResponseEndpoint
+    ) -> Response:
+        incoming = request.headers.get("X-Request-ID", "")
+        # Accept the client's ID only if it is well-formed (prevents log
+        # injection); otherwise generate one.
+        request_id = (
+            incoming if SAFE_ID.match(incoming) else uuid.uuid4().hex
+        )
+        token = request_id_var.set(request_id)
+        start = time.perf_counter()
+        try:
+            response = await call_next(request)
+            response.headers["X-Request-ID"] = request_id
+            # Logged before the reset, so the filter stamps the same ID.
+            log.info(
+                "%s %s -> %s in %.1fms",
+                request.method,
+                request.url.path,
+                response.status_code,
+                (time.perf_counter() - start) * 1000,
+            )
+            return response
+        finally:
+            request_id_var.reset(token)
+```
+
+**File: `backend/app/schemas.py`**
+
+```python
+"""The API contract shared with the SPA (src/api/types.ts mirrors it)."""
+
+from __future__ import annotations
+
+from datetime import datetime
+from enum import StrEnum
+from typing import Annotated
+
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+
+
+class Role(StrEnum):
+    REQUESTER = "requester"
+    AGENT = "agent"
+
+
+class Priority(StrEnum):
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+
+
+class TicketStatus(StrEnum):
+    OPEN = "open"
+    IN_PROGRESS = "in_progress"
+    CLOSED = "closed"
+
+
+class User(BaseModel):
+    username: str
+    role: Role
+
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    expires_in: int
+
+
+class TicketCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    title: Annotated[
+        str,
+        StringConstraints(
+            strip_whitespace=True, min_length=3, max_length=120
+        ),
+    ]
+    description: Annotated[str, Field(max_length=2000)] = ""
+    priority: Priority = Priority.MEDIUM
+
+
+class TicketStatusUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: TicketStatus
+
+
+class TicketOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    title: str
+    description: str
+    priority: Priority
+    status: TicketStatus
+    owner: str
+    created_at: datetime
+
+
+class TicketPage(BaseModel):
+    items: list[TicketOut]
+    total: int
+```
+
+**File: `backend/app/security.py`**
+
+```python
+from __future__ import annotations
+
+from datetime import UTC, datetime, timedelta
+
+import jwt
+from pwdlib import PasswordHash
+
+from app.config import Settings
+from app.schemas import Role, User
+
+hasher = PasswordHash.recommended()
+
+
+class InvalidTokenError(Exception):
+    pass
+
+
+def create_access_token(user: User, settings: Settings) -> str:
+    now = datetime.now(UTC)
+    return jwt.encode(
+        {
+            "sub": user.username,
+            "role": user.role.value,
+            "iss": settings.jwt_issuer,
+            "aud": settings.jwt_audience,
+            "iat": now,
+            "exp": now + timedelta(minutes=settings.access_token_minutes),
+        },
+        settings.jwt_secret.get_secret_value(),
+        algorithm="HS256",
+    )
+
+
+def decode_access_token(token: str, settings: Settings) -> User:
+    try:
+        claims = jwt.decode(
+            token,
+            settings.jwt_secret.get_secret_value(),
+            algorithms=["HS256"],
+            audience=settings.jwt_audience,
+            issuer=settings.jwt_issuer,
+            options={"require": ["exp", "sub", "aud", "iss"]},
+        )
+        return User(username=claims["sub"], role=Role(claims["role"]))
+    except (jwt.PyJWTError, KeyError, ValueError) as exc:
+        raise InvalidTokenError(str(exc)) from exc
+```
+
+**File: `backend/app/services.py`**
+
+```python
+"""Ticket rules, including object-level authorization."""
+
+from __future__ import annotations
+
+from sqlalchemy import Select, func, select
+from sqlalchemy.orm import Session
+
+from app.db import TicketRow
+from app.errors import ForbiddenError, NotFoundError
+from app.schemas import Role, TicketCreate, TicketStatus, User
+
+
+class TicketService:
+    def __init__(self, session: Session, user: User) -> None:
+        self._session = session
+        self._user = user
+
+    def _visible(self) -> Select[TicketRow]:
+        """Requesters only ever see their own tickets: the filter is
+        part of the query, so other rows can never leak."""
+        stmt = select(TicketRow)
+        if self._user.role is Role.REQUESTER:
+            stmt = stmt.where(TicketRow.owner == self._user.username)
+        return stmt
+
+    def list(
+        self, status: TicketStatus | None, limit: int, offset: int
+    ) -> tuple[list[TicketRow], int]:
+        stmt = self._visible()
+        if status is not None:
+            stmt = stmt.where(TicketRow.status == status.value)
+        total = self._session.scalar(
+            select(func.count()).select_from(stmt.subquery())
+        )
+        rows = self._session.scalars(
+            stmt.order_by(TicketRow.id.desc()).limit(limit).offset(offset)
+        ).all()
+        return list(rows), int(total or 0)
+
+    def get(self, ticket_id: int) -> TicketRow:
+        row = self._session.scalar(
+            self._visible().where(TicketRow.id == ticket_id)
+        )
+        if row is None:
+            # 404, not 403: don't reveal that someone else's ticket exists
+            raise NotFoundError(f"Ticket {ticket_id} not found.")
+        return row
+
+    def create(self, data: TicketCreate) -> TicketRow:
+        row = TicketRow(
+            title=data.title,
+            description=data.description,
+            priority=data.priority.value,
+            owner=self._user.username,  # from the token, never the body
+        )
+        with self._session.begin():
+            self._session.add(row)
+        return row
+
+    def update_status(
+        self, ticket_id: int, status: TicketStatus
+    ) -> TicketRow:
+        if self._user.role is not Role.AGENT:
+            raise ForbiddenError("Only agents can change ticket status.")
+        with self._session.begin():
+            row = self.get(ticket_id)
+            row.status = status.value
+        return row
+```
+
+**File: `backend/pyproject.toml`**
+
+```toml
+[project]
+name = "support-desk-api"
+version = "1.0.0"
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 76
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "ASYNC"]
+
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = ["fastapi.Depends", "fastapi.Query"]
+
+[tool.mypy]
+strict = true
+plugins = ["pydantic.mypy"]
+packages = ["app"]
+```
+
+**File: `backend/requirements-dev.txt`**
+
+```text
+-r requirements.txt
+pytest>=8
+httpx>=0.27
+mypy>=1.10
+ruff>=0.6
+```
+
+**File: `backend/requirements.txt`**
+
+```text
+fastapi>=0.135
+uvicorn[standard]>=0.30
+pydantic>=2.9
+pydantic-settings>=2.6
+pyjwt>=2.9
+pwdlib[argon2]>=0.2
+python-multipart>=0.0.12
+email-validator>=2.2
+sqlalchemy>=2.1
+```
+
+**File: `frontend/.env.example`**
+
+```bash
+# Unit 5 default: call the real FastAPI backend via the Vite proxy
+# (same origin in the browser, so CORS is not involved in dev).
+VITE_USE_MOCK=false
+VITE_API_BASE_URL=/api
+# To call the API cross-origin instead (exercises CORS):
+# VITE_API_BASE_URL=http://127.0.0.1:8000
+```
+
+**File: `frontend/.prettierrc.json`**
+
+```json
+{
+  "printWidth": 76
+}
+```
+
+**File: `frontend/e2e/tickets.e2e.ts`**
+
+```typescript
+import { expect, test, type Page } from "@playwright/test";
+
+async function signIn(page: Page, user: string) {
+  await page.goto("/login");
+  await page.getByLabel("Username").fill(user);
+  await page.getByLabel("Password").fill(`${user}-password`);
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await expect(page.getByText(`Signed in as ${user}`)).toBeVisible();
+}
+
+test("requester creates a ticket; agent resolves it", async ({
+  browser,
+}) => {
+  const title = `Laptop fan noise ${Date.now()}`;
+
+  // 1. Requester (alice) files a ticket through the real API.
+  const alice = await browser.newPage();
+  await signIn(alice, "alice");
+  await alice.getByLabel("Title").fill(title);
+  await alice.getByRole("button", { name: "Create ticket" }).click();
+  const aliceRow = alice.getByRole("row").filter({ hasText: title });
+  await expect(aliceRow).toBeVisible();
+  // The UI disables what the API would reject anyway (403).
+  await expect(aliceRow.getByRole("combobox")).toBeDisabled();
+
+  // 2. Another requester (bob) cannot see it: object-level authz.
+  const bob = await browser.newPage();
+  await signIn(bob, "bob");
+  await expect(
+    bob.getByText("No tickets match this filter."),
+  ).toBeVisible();
+  await expect(bob.getByText(title)).toHaveCount(0);
+
+  // 3. Agent sees every ticket and closes alice's.
+  const agent = await browser.newPage();
+  await signIn(agent, "agent");
+  const agentRow = agent.getByRole("row").filter({ hasText: title });
+  await agentRow.getByRole("combobox").selectOption("closed");
+  await expect(agentRow.getByRole("combobox")).toHaveValue("closed");
+
+  // 4. Alice sees the new status after a reload (persisted server-side).
+  await alice.getByLabel("Filter").selectOption("closed");
+  await expect(
+    alice.getByRole("row").filter({ hasText: title }),
+  ).toBeVisible();
+});
+
+test("API responses carry the request ID the SPA sent", async ({
+  page,
+}) => {
+  const response = page.waitForResponse((r) => r.url().endsWith("/me"));
+  await signIn(page, "agent");
+  const me = await response;
+  const sent = me.request().headers()["x-request-id"];
+  expect(sent).toMatch(/^[0-9a-f]{32}$/);
+  expect(me.headers()["x-request-id"]).toBe(sent);
+});
+```
+
+**File: `frontend/index.html`**
+
+```html
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Support Tickets</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+```
+
+**File: `frontend/package.json`**
+
+```json
+{
+  "name": "support-desk-spa",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "preview": "vite preview",
+    "format": "prettier --write \"src/**/*.{ts,tsx}\"",
+    "e2e": "playwright test"
+  },
+  "dependencies": {
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "react-router": "^7.9.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.56.1",
+    "@testing-library/jest-dom": "^7.0.0",
+    "@testing-library/react": "^16.3.0",
+    "@testing-library/user-event": "^14.6.0",
+    "@types/node": "^22.20.5",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "^6.0.0",
+    "jsdom": "^30.0.0",
+    "prettier": "^3.9.10",
+    "typescript": "^7.0.0",
+    "vite": "^8.0.0",
+    "vitest": "^5.0.0"
+  },
+  "engines": {
+    "node": ">=22.12"
+  }
+}
+```
+
+**File: `frontend/playwright.config.ts`**
+
+```typescript
+import { defineConfig, devices } from "@playwright/test";
+
+// Starts BOTH tiers, then drives a real browser against them:
+// browser -> Vite dev server (:5173) -> /api proxy -> FastAPI (:8000).
+// PYTHON lets you point at your backend virtualenv's interpreter.
+const python = process.env.PYTHON ?? "python";
+
+export default defineConfig({
+  testDir: "./e2e",
+  testMatch: "*.e2e.ts",
+  fullyParallel: false,
+  retries: process.env.CI ? 1 : 0,
+  reporter: process.env.CI ? "github" : "list",
+  use: {
+    baseURL: "http://127.0.0.1:5173",
+    trace: "retain-on-failure",
+  },
+  projects: [
+    {
+      name: "chromium",
+      use: {
+        ...devices["Desktop Chrome"],
+        launchOptions: {
+          // Pre-installed browser (e.g. CI image); otherwise run
+          // `npx playwright install chromium` once.
+          executablePath: process.env.PW_CHROMIUM_PATH || undefined,
+        },
+      },
+    },
+  ],
+  webServer: [
+    {
+      command: `${python} -m uvicorn app.main:create_app --factory`,
+      cwd: "../backend",
+      url: "http://127.0.0.1:8000/health",
+      reuseExistingServer: !process.env.CI,
+      env: {
+        APP_ENV: "dev",
+        APP_JWT_SECRET: "e2e-secret-e2e-secret-e2e-secret-e2e!",
+        APP_DATABASE_URL: "sqlite://", // fresh DB every run
+        APP_DEMO_USERS:
+          "agent:agent-password:agent," +
+          "alice:alice-password:requester," +
+          "bob:bob-password:requester",
+      },
+    },
+    {
+      command: "npx vite --port 5173 --strictPort --host 127.0.0.1",
+      url: "http://127.0.0.1:5173",
+      reuseExistingServer: !process.env.CI,
+      env: { VITE_USE_MOCK: "false", VITE_API_BASE_URL: "/api" },
+    },
+  ],
+});
+```
+
+**File: `frontend/src/App.test.tsx`**
+
+```tsx
+import { render, screen, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { MemoryRouter } from "react-router";
+import { describe, expect, it } from "vitest";
+import { createMockFetch } from "./api/mockServer";
+import { App } from "./App";
+import { AuthProvider } from "./auth/AuthContext";
+
+function renderApp(path = "/tickets") {
+  const fetchImpl = createMockFetch({ latencyMs: 0 });
+  return render(
+    <MemoryRouter initialEntries={[path]}>
+      <AuthProvider fetchImpl={fetchImpl}>
+        <App />
+      </AuthProvider>
+    </MemoryRouter>,
+  );
+}
+
+async function signIn(password = "agent-password", user = "agent") {
+  await userEvent.type(screen.getByLabelText("Username"), user);
+  await userEvent.type(screen.getByLabelText("Password"), password);
+  await userEvent.click(screen.getByRole("button", { name: "Sign in" }));
+}
+
+describe("App", () => {
+  it("redirects anonymous users to the login page", () => {
+    renderApp("/tickets");
+    expect(
+      screen.getByRole("heading", { name: "Sign in" }),
+    ).toBeInTheDocument();
+  });
+
+  it("shows an error for bad credentials", async () => {
+    renderApp();
+    await signIn("wrong");
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Incorrect username or password",
+    );
+  });
+
+  it("logs in, lists, creates and filters tickets", async () => {
+    renderApp();
+    await signIn();
+
+    expect(
+      await screen.findByText("VPN drops every hour"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("Signed in as agent (agent)"),
+    ).toBeInTheDocument();
+
+    await userEvent.type(
+      screen.getByLabelText("Title"),
+      "Laptop will not boot",
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: "Create ticket" }),
+    );
+    expect(
+      await screen.findByText("Laptop will not boot"),
+    ).toBeInTheDocument();
+
+    await userEvent.selectOptions(
+      screen.getByLabelText("Filter"),
+      "in_progress",
+    );
+    expect(
+      await screen.findByText("Request new monitor"),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText("VPN drops every hour"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("updates a ticket status", async () => {
+    renderApp();
+    await signIn();
+    const select = await screen.findByLabelText("Status of ticket 1");
+    await userEvent.selectOptions(select, "closed");
+    const row = select.closest("tr")!;
+    expect(within(row).getByLabelText("Status of ticket 1")).toHaveValue(
+      "closed",
+    );
+  });
+
+  it("signs out", async () => {
+    renderApp();
+    await signIn();
+    await screen.findByText("VPN drops every hour");
+    await userEvent.click(screen.getByRole("button", { name: "Sign out" }));
+    expect(
+      screen.getByRole("heading", { name: "Sign in" }),
+    ).toBeInTheDocument();
+  });
+
+  it("requester sees own tickets, read-only status", async () => {
+    renderApp();
+    await signIn("alice-password", "alice");
+    expect(
+      await screen.findByText("VPN drops every hour"),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText("Request new monitor"),
+    ).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Status of ticket 1")).toBeDisabled();
+  });
+});
+```
+
+**File: `frontend/src/App.tsx`**
+
+```tsx
+import { Navigate, Route, Routes } from "react-router";
+import { ProtectedRoute } from "./auth/ProtectedRoute";
+import { LoginPage } from "./pages/LoginPage";
+import { TicketsPage } from "./pages/TicketsPage";
+
+export function App() {
+  return (
+    <Routes>
+      <Route path="/login" element={<LoginPage />} />
+      <Route
+        path="/tickets"
+        element={
+          <ProtectedRoute>
+            <TicketsPage />
+          </ProtectedRoute>
+        }
+      />
+      <Route path="*" element={<Navigate to="/tickets" replace />} />
+    </Routes>
+  );
+}
+```
+
+**File: `frontend/src/api/client.test.ts`**
+
+```typescript
+import { describe, expect, it, vi } from "vitest";
+import { ApiError, createApiClient } from "./client";
+
+function jsonResponse(status: number, body: unknown): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+describe("createApiClient", () => {
+  it("sends the bearer token and JSON body", async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse(201, { id: 1 }));
+    const client = createApiClient({
+      baseUrl: "/api",
+      getToken: () => "abc",
+      fetchImpl,
+    });
+    await client.request("/tickets", { method: "POST", body: { a: 1 } });
+
+    const [url, init] = fetchImpl.mock.calls[0] as unknown as [
+      string,
+      RequestInit,
+    ];
+    const headers = new Headers(init.headers);
+    expect(url).toBe("/api/tickets");
+    expect(headers.get("Authorization")).toBe("Bearer abc");
+    expect(headers.get("Content-Type")).toBe("application/json");
+    expect(init.body).toBe('{"a":1}');
+  });
+
+  it("form-encodes login bodies", async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse(200, {}));
+    const client = createApiClient({
+      baseUrl: "",
+      getToken: () => null,
+      fetchImpl,
+    });
+    await client.request("/auth/token", {
+      method: "POST",
+      form: { username: "a" },
+    });
+    const init = (
+      fetchImpl.mock.calls[0] as unknown as [string, RequestInit]
+    )[1];
+    expect(String(init.body)).toBe("username=a");
+  });
+
+  it("turns problem+json into ApiError", async () => {
+    const fetchImpl = vi.fn(async () =>
+      jsonResponse(409, {
+        title: "Conflict",
+        status: 409,
+        detail: "Duplicate",
+      }),
+    );
+    const client = createApiClient({
+      baseUrl: "",
+      getToken: () => null,
+      fetchImpl,
+    });
+    const error = await client.request("/x").catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(ApiError);
+    expect((error as ApiError).status).toBe(409);
+    expect((error as ApiError).message).toBe("Duplicate");
+  });
+
+  it("calls onUnauthorized on 401", async () => {
+    const onUnauthorized = vi.fn();
+    const fetchImpl = vi.fn(async () =>
+      jsonResponse(401, { detail: "Invalid or expired token" }),
+    );
+    const client = createApiClient({
+      baseUrl: "",
+      getToken: () => "old",
+      fetchImpl,
+      onUnauthorized,
+    });
+    await expect(client.request("/x")).rejects.toBeInstanceOf(ApiError);
+    expect(onUnauthorized).toHaveBeenCalledOnce();
+  });
+
+  it("times out slow requests", async () => {
+    const fetchImpl = vi.fn(
+      (_url: RequestInfo | URL, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () =>
+            reject(new DOMException("aborted", "AbortError")),
+          );
+        }),
+    );
+    const client = createApiClient({
+      baseUrl: "",
+      getToken: () => null,
+      fetchImpl,
+      timeoutMs: 20,
+    });
+    const error = (await client
+      .request("/slow")
+      .catch((e: unknown) => e)) as ApiError;
+    expect(error.status).toBe(0);
+    expect(error.problem.title).toBe("Timeout");
+  });
+
+  it("returns undefined for 204", async () => {
+    const fetchImpl = vi.fn(
+      async () => new Response(null, { status: 204 }),
+    );
+    const client = createApiClient({
+      baseUrl: "",
+      getToken: () => null,
+      fetchImpl,
+    });
+    await expect(
+      client.request("/x", { method: "DELETE" }),
+    ).resolves.toBeUndefined();
+  });
+
+  it("sends X-Request-ID and attaches it to errors", async () => {
+    const fetchImpl = vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({ title: "Boom", status: 500, request_id: "r1" }),
+          { status: 500, headers: { "X-Request-ID": "r1" } },
+        ),
+    );
+    const client = createApiClient({
+      baseUrl: "",
+      getToken: () => null,
+      fetchImpl,
+      newRequestId: () => "r1",
+    });
+    const error = (await client
+      .request("/x")
+      .catch((e: unknown) => e)) as ApiError;
+    const init = (
+      fetchImpl.mock.calls[0] as unknown as [string, RequestInit]
+    )[1];
+    expect(new Headers(init.headers).get("X-Request-ID")).toBe("r1");
+    expect(error.requestId).toBe("r1");
+    expect(error.problem.request_id).toBe("r1");
+  });
+});
+```
+
+**File: `frontend/src/api/client.ts`**
+
+```typescript
+import type { Problem } from "./types";
+
+/** Error carrying the HTTP status and the parsed problem body. */
+export class ApiError extends Error {
+  constructor(
+    readonly status: number,
+    readonly problem: Problem,
+    /** Correlates this failure with backend logs (support tickets!). */
+    readonly requestId?: string,
+  ) {
+    super(problem.detail ?? problem.title);
+    this.name = "ApiError";
+  }
+}
+
+export interface ApiClientOptions {
+  baseUrl: string;
+  getToken: () => string | null;
+  onUnauthorized?: () => void;
+  fetchImpl?: typeof fetch;
+  timeoutMs?: number;
+  newRequestId?: () => string;
+}
+
+export interface RequestOptions {
+  method?: string;
+  body?: unknown;
+  form?: Record<string, string>;
+  signal?: AbortSignal;
+}
+
+export interface ApiClient {
+  request<T>(path: string, options?: RequestOptions): Promise<T>;
+}
+
+/**
+ * One place for cross-cutting HTTP concerns: base URL, auth header,
+ * JSON/form encoding, timeout, error parsing and 401 handling.
+ */
+export function createApiClient(opts: ApiClientOptions): ApiClient {
+  const fetchImpl = opts.fetchImpl ?? globalThis.fetch.bind(globalThis);
+  const timeoutMs = opts.timeoutMs ?? 10_000;
+  const newRequestId =
+    opts.newRequestId ?? (() => crypto.randomUUID().replaceAll("-", ""));
+
+  async function request<T>(
+    path: string,
+    options: RequestOptions = {},
+  ): Promise<T> {
+    // The same ID appears in the browser console, the response header
+    // and every backend log line for this request.
+    const requestId = newRequestId();
+    const headers = new Headers({
+      Accept: "application/json",
+      "X-Request-ID": requestId,
+    });
+    const token = opts.getToken();
+    if (token) headers.set("Authorization", `Bearer ${token}`);
+
+    let body: BodyInit | undefined;
+    if (options.form) {
+      body = new URLSearchParams(options.form);
+      headers.set("Content-Type", "application/x-www-form-urlencoded");
+    } else if (options.body !== undefined) {
+      body = JSON.stringify(options.body);
+      headers.set("Content-Type", "application/json");
+    }
+
+    // Abort when the timeout fires OR when the caller aborts (e.g. a
+    // component unmounted).
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    options.signal?.addEventListener("abort", () => controller.abort());
+
+    let response: Response;
+    try {
+      response = await fetchImpl(`${opts.baseUrl}${path}`, {
+        method: options.method ?? "GET",
+        headers,
+        body,
+        signal: controller.signal,
+      });
+    } catch (err) {
+      if (options.signal?.aborted) throw err; // caller cancelled
+      throw new ApiError(
+        0,
+        {
+          title: controller.signal.aborted ? "Timeout" : "Network error",
+          status: 0,
+          detail: controller.signal.aborted
+            ? `No response within ${timeoutMs} ms`
+            : "Could not reach the server",
+        },
+        requestId,
+      );
+    } finally {
+      clearTimeout(timer);
+    }
+
+    if (response.status === 401) opts.onUnauthorized?.();
+    if (!response.ok) {
+      let problem: Problem;
+      try {
+        const data = (await response.json()) as Partial<Problem> & {
+          detail?: unknown;
+        };
+        problem = {
+          title: data.title ?? response.statusText ?? "Error",
+          status: response.status,
+          // FastAPI's default errors put a string in "detail".
+          detail: typeof data.detail === "string" ? data.detail : undefined,
+          errors: data.errors,
+          request_id: data.request_id,
+        };
+      } catch {
+        problem = { title: response.statusText, status: response.status };
+      }
+      throw new ApiError(
+        response.status,
+        problem,
+        response.headers.get("X-Request-ID") ?? requestId,
+      );
+    }
+    if (response.status === 204) return undefined as T;
+    return (await response.json()) as T;
+  }
+
+  return { request };
+}
+```
+
+**File: `frontend/src/api/mockServer.ts`**
+
+```typescript
+import type { Problem, Role, Ticket, TicketStatus } from "./types";
+
+/**
+ * In-memory backend that speaks the same HTTP contract as the FastAPI
+ * service in Unit 5. It returns real `Response` objects, so the API
+ * client cannot tell the difference: swapping it for the real backend
+ * is a configuration change, not a code change.
+ */
+const USERS: Record<string, { password: string; role: Role }> = {
+  agent: { password: "agent-password", role: "agent" },
+  alice: { password: "alice-password", role: "requester" },
+};
+
+function json(status: number, body: unknown): Response {
+  return new Response(body === undefined ? null : JSON.stringify(body), {
+    status,
+    headers: {
+      "Content-Type":
+        status >= 400 ? "application/problem+json" : "application/json",
+    },
+  });
+}
+
+function problem(
+  status: number,
+  title: string,
+  extra: Partial<Problem> = {},
+) {
+  return json(status, { title, status, ...extra });
+}
+
+export function createMockFetch(options: { latencyMs?: number } = {}) {
+  const tickets: Ticket[] = [
+    {
+      id: 1,
+      title: "VPN drops every hour",
+      description: "Started after the 2.3 client update.",
+      priority: "high",
+      status: "open",
+      owner: "alice",
+      created_at: "2026-10-01T09:00:00Z",
+    },
+    {
+      id: 2,
+      title: "Request new monitor",
+      description: "27-inch for the design team.",
+      priority: "low",
+      status: "in_progress",
+      owner: "bob",
+      created_at: "2026-10-02T10:30:00Z",
+    },
+  ];
+  let nextId = 3;
+  const latency = options.latencyMs ?? 150;
+
+  return async function mockFetch(
+    input: RequestInfo | URL,
+    init: RequestInit = {},
+  ): Promise<Response> {
+    await new Promise((resolve) => setTimeout(resolve, latency));
+    if (init.signal?.aborted) {
+      throw new DOMException("The operation was aborted.", "AbortError");
+    }
+    const url = new URL(String(input), "http://mock.local");
+    const method = (init.method ?? "GET").toUpperCase();
+    const headers = new Headers(init.headers);
+
+    if (url.pathname === "/auth/token" && method === "POST") {
+      const form = new URLSearchParams(String(init.body ?? ""));
+      const user = form.get("username") ?? "";
+      if (USERS[user] && USERS[user].password === form.get("password")) {
+        return json(200, {
+          access_token: `mock-token-${user}`,
+          token_type: "bearer",
+          expires_in: 1800,
+        });
+      }
+      return problem(401, "Unauthorized", {
+        detail: "Incorrect username or password",
+      });
+    }
+
+    const auth = headers.get("Authorization") ?? "";
+    const username = auth.replace("Bearer mock-token-", "");
+    const me = USERS[username];
+    if (!auth.startsWith("Bearer mock-token-") || !me) {
+      return problem(401, "Unauthorized", { detail: "Not authenticated" });
+    }
+    // Same rule as the backend: requesters only see their own tickets.
+    const visible = (t: Ticket) =>
+      me.role === "agent" || t.owner === username;
+
+    if (url.pathname === "/me" && method === "GET") {
+      return json(200, { username, role: me.role });
+    }
+
+    if (url.pathname === "/tickets" && method === "GET") {
+      const status = url.searchParams.get("status");
+      const items = tickets
+        .filter(visible)
+        .filter((t) => !status || t.status === status)
+        .sort((a, b) => b.id - a.id);
+      return json(200, { items, total: items.length });
+    }
+
+    if (url.pathname === "/tickets" && method === "POST") {
+      const body = JSON.parse(String(init.body ?? "{}"));
+      const title = String(body.title ?? "").trim();
+      if (title.length < 3 || title.length > 120) {
+        return problem(422, "Validation failed", {
+          detail: "The request body is invalid.",
+          errors: [
+            { loc: ["body", "title"], msg: "must be 3-120 characters" },
+          ],
+        });
+      }
+      const ticket: Ticket = {
+        id: nextId++,
+        title,
+        description: String(body.description ?? ""),
+        priority: body.priority ?? "medium",
+        status: "open",
+        owner: username,
+        created_at: new Date().toISOString(),
+      };
+      tickets.push(ticket);
+      return json(201, ticket);
+    }
+
+    const match = url.pathname.match(/^\/tickets\/(\d+)$/);
+    if (match && method === "PATCH") {
+      const ticket = tickets.find((t) => t.id === Number(match[1]));
+      if (!ticket || !visible(ticket)) return problem(404, "Not found");
+      if (me.role !== "agent") {
+        return problem(403, "Forbidden", {
+          detail: "Only agents can change ticket status.",
+        });
+      }
+      const body = JSON.parse(String(init.body ?? "{}"));
+      ticket.status = body.status as TicketStatus;
+      return json(200, ticket);
+    }
+    return problem(404, "Not found");
+  };
+}
+```
+
+**File: `frontend/src/api/tickets.ts`**
+
+```typescript
+import type { ApiClient } from "./client";
+import type {
+  Me,
+  Ticket,
+  TicketCreate,
+  TicketPage,
+  TicketStatus,
+  TokenResponse,
+} from "./types";
+
+/** Typed endpoint functions. Components never build URLs themselves. */
+export function ticketsApi(client: ApiClient) {
+  return {
+    login: (username: string, password: string) =>
+      client.request<TokenResponse>("/auth/token", {
+        method: "POST",
+        form: { username, password },
+      }),
+    me: () => client.request<Me>("/me"),
+    list: (status: TicketStatus | "all", signal?: AbortSignal) =>
+      client.request<TicketPage>(
+        status === "all" ? "/tickets" : `/tickets?status=${status}`,
+        { signal },
+      ),
+    create: (data: TicketCreate) =>
+      client.request<Ticket>("/tickets", { method: "POST", body: data }),
+    updateStatus: (id: number, status: TicketStatus) =>
+      client.request<Ticket>(`/tickets/${id}`, {
+        method: "PATCH",
+        body: { status },
+      }),
+  };
+}
+
+export type TicketsApi = ReturnType<typeof ticketsApi>;
+```
+
+**File: `frontend/src/api/types.ts`**
+
+```typescript
+// API models: the TypeScript mirror of the backend's OpenAPI contract.
+// In larger projects generate these with `openapi-typescript`.
+
+export type Priority = "low" | "medium" | "high";
+export type TicketStatus = "open" | "in_progress" | "closed";
+export type Role = "requester" | "agent";
+
+export interface Me {
+  username: string;
+  role: Role;
+}
+
+export interface Ticket {
+  id: number;
+  title: string;
+  description: string;
+  priority: Priority;
+  status: TicketStatus;
+  owner: string;
+  created_at: string; // ISO-8601 string on the wire
+}
+
+export interface TicketCreate {
+  title: string;
+  description: string;
+  priority: Priority;
+}
+
+export interface TicketPage {
+  items: Ticket[];
+  total: number;
+}
+
+export interface TokenResponse {
+  access_token: string;
+  token_type: "bearer";
+  expires_in: number;
+}
+
+// RFC 9457 problem details returned by the backend on errors.
+export interface Problem {
+  title: string;
+  status: number;
+  detail?: string;
+  request_id?: string;
+  errors?: { loc: (string | number)[]; msg: string }[];
+}
+```
+
+**File: `frontend/src/auth/AuthContext.tsx`**
+
+```tsx
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
+import { createApiClient } from "../api/client";
+import { ticketsApi, type TicketsApi } from "../api/tickets";
+import type { Role } from "../api/types";
+
+interface AuthState {
+  username: string | null;
+  role: Role | null;
+  isAuthenticated: boolean;
+  api: TicketsApi;
+  login: (username: string, password: string) => Promise<void>;
+  logout: () => void;
+}
+
+const AuthContext = createContext<AuthState | null>(null);
+
+interface AuthProviderProps {
+  children: ReactNode;
+  baseUrl?: string;
+  fetchImpl?: typeof fetch;
+}
+
+/**
+ * Holds the access token IN MEMORY (not localStorage) so an XSS bug
+ * cannot simply read it from storage. Trade-off: a page refresh logs
+ * the user out; production apps add a refresh token in an httpOnly
+ * cookie or a backend-for-frontend.
+ */
+export function AuthProvider({
+  children,
+  baseUrl = "",
+  fetchImpl,
+}: AuthProviderProps) {
+  const [username, setUsername] = useState<string | null>(null);
+  const [role, setRole] = useState<Role | null>(null);
+  const tokenRef = useRef<string | null>(null);
+
+  const logout = useCallback(() => {
+    tokenRef.current = null;
+    setUsername(null);
+    setRole(null);
+  }, []);
+
+  const api = useMemo(
+    () =>
+      ticketsApi(
+        createApiClient({
+          baseUrl,
+          fetchImpl,
+          getToken: () => tokenRef.current,
+          onUnauthorized: logout, // expired token → back to login
+        }),
+      ),
+    [baseUrl, fetchImpl, logout],
+  );
+
+  const login = useCallback(
+    async (user: string, password: string) => {
+      const token = await api.login(user, password);
+      tokenRef.current = token.access_token;
+      // Ask the server who we are instead of trusting client-side
+      // claims. The UI only hides buttons; the API enforces the rules.
+      const me = await api.me();
+      setRole(me.role);
+      setUsername(me.username);
+    },
+    [api],
+  );
+
+  const value = useMemo<AuthState>(
+    () => ({
+      username,
+      role,
+      isAuthenticated: username !== null,
+      api,
+      login,
+      logout,
+    }),
+    [username, role, api, login, logout],
+  );
+  return (
+    <AuthContext.Provider value={value}>{children}</AuthContext.Provider>
+  );
+}
+
+export function useAuth(): AuthState {
+  const ctx = useContext(AuthContext);
+  if (!ctx) throw new Error("useAuth must be used inside <AuthProvider>");
+  return ctx;
+}
+```
+
+**File: `frontend/src/auth/ProtectedRoute.tsx`**
+
+```tsx
+import type { ReactNode } from "react";
+import { Navigate, useLocation } from "react-router";
+import { useAuth } from "./AuthContext";
+
+/** UX guard only. Real authorization is enforced by the API. */
+export function ProtectedRoute({ children }: { children: ReactNode }) {
+  const { isAuthenticated } = useAuth();
+  const location = useLocation();
+  if (!isAuthenticated) {
+    return (
+      <Navigate to="/login" replace state={{ from: location.pathname }} />
+    );
+  }
+  return <>{children}</>;
+}
+```
+
+**File: `frontend/src/components/TicketForm.test.tsx`**
+
+```tsx
+import { render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { describe, expect, it, vi } from "vitest";
+import { ApiError } from "../api/client";
+import { TicketForm, validate } from "./TicketForm";
+
+describe("validate", () => {
+  it("rejects short titles", () => {
+    expect(
+      validate({ title: " ab ", description: "", priority: "low" }).title,
+    ).toBeDefined();
+  });
+});
+
+describe("TicketForm", () => {
+  it("shows a validation error and does not submit", async () => {
+    const onSubmit = vi.fn();
+    render(<TicketForm onSubmit={onSubmit} />);
+    await userEvent.type(screen.getByLabelText("Title"), "ab");
+    await userEvent.click(
+      screen.getByRole("button", { name: "Create ticket" }),
+    );
+    expect(screen.getByRole("alert")).toHaveTextContent("3-120 characters");
+    expect(onSubmit).not.toHaveBeenCalled();
+  });
+
+  it("submits trimmed values and resets", async () => {
+    const onSubmit = vi.fn(async () => undefined);
+    render(<TicketForm onSubmit={onSubmit} />);
+    await userEvent.type(screen.getByLabelText("Title"), "  Printer jam  ");
+    await userEvent.selectOptions(
+      screen.getByLabelText("Priority"),
+      "high",
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: "Create ticket" }),
+    );
+    expect(onSubmit).toHaveBeenCalledWith({
+      title: "Printer jam",
+      description: "",
+      priority: "high",
+    });
+    expect(screen.getByLabelText("Title")).toHaveValue("");
+  });
+
+  it("maps server field errors onto fields", async () => {
+    const onSubmit = vi.fn(async () => {
+      throw new ApiError(422, {
+        title: "Validation failed",
+        status: 422,
+        errors: [{ loc: ["body", "title"], msg: "already taken" }],
+      });
+    });
+    render(<TicketForm onSubmit={onSubmit} />);
+    await userEvent.type(screen.getByLabelText("Title"), "Valid title");
+    await userEvent.click(
+      screen.getByRole("button", { name: "Create ticket" }),
+    );
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "already taken",
+    );
+  });
+});
+```
+
+**File: `frontend/src/components/TicketForm.tsx`**
+
+```tsx
+import { useState, type FormEvent } from "react";
+import { ApiError } from "../api/client";
+import type { Priority, TicketCreate } from "../api/types";
+
+interface Props {
+  onSubmit: (data: TicketCreate) => Promise<unknown>;
+}
+
+type FieldErrors = Partial<Record<keyof TicketCreate, string>>;
+
+export function validate(data: TicketCreate): FieldErrors {
+  const errors: FieldErrors = {};
+  const title = data.title.trim();
+  if (title.length < 3 || title.length > 120) {
+    errors.title = "Title must be 3-120 characters.";
+  }
+  if (data.description.length > 2000) {
+    errors.description = "Description must be at most 2000 characters.";
+  }
+  return errors;
+}
+
+/** Controlled form: React state is the single source of truth. */
+export function TicketForm({ onSubmit }: Props) {
+  const [values, setValues] = useState<TicketCreate>({
+    title: "",
+    description: "",
+    priority: "medium",
+  });
+  const [errors, setErrors] = useState<FieldErrors>({});
+  const [formError, setFormError] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+
+  function update<K extends keyof TicketCreate>(
+    key: K,
+    value: TicketCreate[K],
+  ) {
+    setValues((v) => ({ ...v, [key]: value }));
+  }
+
+  async function handleSubmit(event: FormEvent) {
+    event.preventDefault();
+    // Client-side validation is for fast feedback; the server
+    // validates again because the client can be bypassed.
+    const clientErrors = validate(values);
+    setErrors(clientErrors);
+    setFormError(null);
+    if (Object.keys(clientErrors).length > 0) return;
+
+    setSubmitting(true);
+    try {
+      await onSubmit({ ...values, title: values.title.trim() });
+      setValues({ title: "", description: "", priority: "medium" });
+    } catch (err) {
+      if (err instanceof ApiError && err.problem.errors) {
+        // Map server-side field errors back onto the form fields.
+        const serverErrors: FieldErrors = {};
+        for (const e of err.problem.errors) {
+          const field = e.loc[e.loc.length - 1] as keyof TicketCreate;
+          serverErrors[field] = e.msg;
+        }
+        setErrors(serverErrors);
+      } else {
+        setFormError(err instanceof Error ? err.message : "Request failed");
+      }
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <form onSubmit={handleSubmit} aria-label="New ticket" noValidate>
+      <label>
+        Title
+        <input
+          value={values.title}
+          onChange={(e) => update("title", e.target.value)}
+          aria-invalid={Boolean(errors.title)}
+        />
+      </label>
+      {errors.title && <p role="alert">{errors.title}</p>}
+      <label>
+        Description
+        <textarea
+          value={values.description}
+          onChange={(e) => update("description", e.target.value)}
+        />
+      </label>
+      {errors.description && <p role="alert">{errors.description}</p>}
+      <label>
+        Priority
+        <select
+          value={values.priority}
+          onChange={(e) => update("priority", e.target.value as Priority)}
+        >
+          <option value="low">Low</option>
+          <option value="medium">Medium</option>
+          <option value="high">High</option>
+        </select>
+      </label>
+      {formError && <p role="alert">{formError}</p>}
+      <button type="submit" disabled={submitting}>
+        {submitting ? "Saving…" : "Create ticket"}
+      </button>
+    </form>
+  );
+}
+```
+
+**File: `frontend/src/components/TicketList.tsx`**
+
+```tsx
+import type { Ticket, TicketStatus } from "../api/types";
+
+interface Props {
+  tickets: Ticket[];
+  canEditStatus: boolean;
+  onStatusChange: (id: number, status: TicketStatus) => void;
+}
+
+export function TicketList({
+  tickets,
+  canEditStatus,
+  onStatusChange,
+}: Props) {
+  if (tickets.length === 0) return <p>No tickets match this filter.</p>;
+  return (
+    <table>
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>Title</th>
+          <th>Owner</th>
+          <th>Priority</th>
+          <th>Status</th>
+        </tr>
+      </thead>
+      <tbody>
+        {tickets.map((t) => (
+          // `key` lets React match rows between renders efficiently.
+          <tr key={t.id}>
+            <td>{t.id}</td>
+            <td>{t.title}</td>
+            <td>{t.owner}</td>
+            <td>{t.priority}</td>
+            <td>
+              <select
+                disabled={!canEditStatus}
+                aria-label={`Status of ticket ${t.id}`}
+                value={t.status}
+                onChange={(e) =>
+                  onStatusChange(t.id, e.target.value as TicketStatus)
+                }
+              >
+                <option value="open">Open</option>
+                <option value="in_progress">In progress</option>
+                <option value="closed">Closed</option>
+              </select>
+            </td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+```
+
+**File: `frontend/src/hooks/useTickets.ts`**
+
+```typescript
+import { useCallback, useEffect, useState } from "react";
+import { ApiError } from "../api/client";
+import type { Ticket, TicketCreate, TicketStatus } from "../api/types";
+import { useAuth } from "../auth/AuthContext";
+
+// A discriminated union makes impossible states unrepresentable:
+// you cannot have data AND an error AND loading at the same time.
+export type LoadState =
+  | { kind: "loading" }
+  | { kind: "error"; message: string }
+  | { kind: "ready"; tickets: Ticket[] };
+
+export function useTickets(filter: TicketStatus | "all") {
+  const { api } = useAuth();
+  const [state, setState] = useState<LoadState>({ kind: "loading" });
+  const [reloadKey, setReloadKey] = useState(0);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    setState({ kind: "loading" });
+    api
+      .list(filter, controller.signal)
+      .then((page) => setState({ kind: "ready", tickets: page.items }))
+      .catch((err: unknown) => {
+        if (controller.signal.aborted) return; // stale request: ignore
+        const message =
+          err instanceof ApiError ? err.message : "Unexpected error";
+        setState({ kind: "error", message });
+      });
+    // Cleanup runs when filter changes or the component unmounts, so a
+    // slow old response can never overwrite newer data.
+    return () => controller.abort();
+  }, [api, filter, reloadKey]);
+
+  const reload = useCallback(() => setReloadKey((k) => k + 1), []);
+
+  const create = useCallback(
+    async (data: TicketCreate) => {
+      const ticket = await api.create(data);
+      setState((s) =>
+        s.kind === "ready" ? { ...s, tickets: [ticket, ...s.tickets] } : s,
+      );
+      return ticket;
+    },
+    [api],
+  );
+
+  const updateStatus = useCallback(
+    async (id: number, status: TicketStatus) => {
+      const updated = await api.updateStatus(id, status);
+      setState((s) =>
+        s.kind === "ready"
+          ? {
+              ...s,
+              tickets: s.tickets.map((t) => (t.id === id ? updated : t)),
+            }
+          : s,
+      );
+    },
+    [api],
+  );
+
+  return { state, reload, create, updateStatus };
+}
+```
+
+**File: `frontend/src/main.tsx`**
+
+```tsx
+import { StrictMode } from "react";
+import { createRoot } from "react-dom/client";
+import { BrowserRouter } from "react-router";
+import { createMockFetch } from "./api/mockServer";
+import { App } from "./App";
+import { AuthProvider } from "./auth/AuthContext";
+import "./styles.css";
+
+// Unit 5 default: the real FastAPI backend. VITE_USE_MOCK=true keeps
+// the Unit 4 in-memory mock for frontend-only work.
+const useMock = import.meta.env.VITE_USE_MOCK === "true";
+const fetchImpl = useMock ? createMockFetch() : undefined;
+const baseUrl = useMock
+  ? ""
+  : (import.meta.env.VITE_API_BASE_URL ?? "/api");
+
+createRoot(document.getElementById("root")!).render(
+  <StrictMode>
+    <BrowserRouter>
+      <AuthProvider baseUrl={baseUrl} fetchImpl={fetchImpl}>
+        <App />
+      </AuthProvider>
+    </BrowserRouter>
+  </StrictMode>,
+);
+```
+
+**File: `frontend/src/pages/LoginPage.tsx`**
+
+```tsx
+import { useState, type FormEvent } from "react";
+import { useLocation, useNavigate } from "react-router";
+import { ApiError } from "../api/client";
+import { useAuth } from "../auth/AuthContext";
+
+export function LoginPage() {
+  const { login } = useAuth();
+  const navigate = useNavigate();
+  const location = useLocation();
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  async function handleSubmit(event: FormEvent) {
+    event.preventDefault();
+    setBusy(true);
+    setError(null);
+    try {
+      await login(username, password);
+      const from = (location.state as { from?: string } | null)?.from;
+      navigate(from ?? "/tickets", { replace: true });
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Login failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <main>
+      <h1>Sign in</h1>
+      <form onSubmit={handleSubmit} aria-label="Sign in">
+        <label>
+          Username
+          <input
+            value={username}
+            onChange={(e) => setUsername(e.target.value)}
+          />
+        </label>
+        <label>
+          Password
+          <input
+            type="password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+          />
+        </label>
+        {error && <p role="alert">{error}</p>}
+        <button type="submit" disabled={busy}>
+          {busy ? "Signing in…" : "Sign in"}
+        </button>
+      </form>
+      <p className="hint">Demo: agent / agent-password</p>
+    </main>
+  );
+}
+```
+
+**File: `frontend/src/pages/TicketsPage.tsx`**
+
+```tsx
+import { useState } from "react";
+import { ApiError } from "../api/client";
+import type { TicketStatus } from "../api/types";
+import { useAuth } from "../auth/AuthContext";
+import { TicketForm } from "../components/TicketForm";
+import { TicketList } from "../components/TicketList";
+import { useTickets } from "../hooks/useTickets";
+
+export function TicketsPage() {
+  const { username, role, logout } = useAuth();
+  const [filter, setFilter] = useState<TicketStatus | "all">("all");
+  const { state, reload, create, updateStatus } = useTickets(filter);
+  const [actionError, setActionError] = useState<string | null>(null);
+
+  async function changeStatus(id: number, status: TicketStatus) {
+    setActionError(null);
+    try {
+      await updateStatus(id, status);
+    } catch (err) {
+      const ref =
+        err instanceof ApiError && err.requestId
+          ? ` (ref ${err.requestId})`
+          : "";
+      setActionError(
+        (err instanceof Error ? err.message : "Update failed") + ref,
+      );
+    }
+  }
+
+  return (
+    <main>
+      <header>
+        <h1>Support tickets</h1>
+        <span>
+          Signed in as {username} ({role})
+        </span>
+        <button onClick={logout}>Sign out</button>
+      </header>
+      <TicketForm onSubmit={create} />
+      <label>
+        Filter
+        <select
+          value={filter}
+          onChange={(e) =>
+            setFilter(e.target.value as TicketStatus | "all")
+          }
+        >
+          <option value="all">All</option>
+          <option value="open">Open</option>
+          <option value="in_progress">In progress</option>
+          <option value="closed">Closed</option>
+        </select>
+      </label>
+      {actionError && <p role="alert">{actionError}</p>}
+      {state.kind === "loading" && <p aria-busy="true">Loading tickets…</p>}
+      {state.kind === "error" && (
+        <div role="alert">
+          <p>Could not load tickets: {state.message}</p>
+          <button onClick={reload}>Retry</button>
+        </div>
+      )}
+      {state.kind === "ready" && (
+        <TicketList
+          tickets={state.tickets}
+          canEditStatus={role === "agent"}
+          onStatusChange={changeStatus}
+        />
+      )}
+    </main>
+  );
+}
+```
+
+**File: `frontend/src/styles.css`**
+
+```css
+body { font-family: system-ui, sans-serif; margin: 2rem; max-width: 960px; }
+form { display: grid; gap: 0.5rem; margin-bottom: 1rem; max-width: 480px; }
+label { display: grid; gap: 0.25rem; }
+table { border-collapse: collapse; width: 100%; }
+th, td { border-bottom: 1px solid #ddd; padding: 0.4rem; text-align: left; }
+[role="alert"] { color: #b00020; }
+header { display: flex; gap: 1rem; align-items: center; }
+.hint { color: #666; }
+```
+
+**File: `frontend/src/test/setup.ts`**
+
+```typescript
+import "@testing-library/jest-dom/vitest";
+import { cleanup } from "@testing-library/react";
+import { afterEach } from "vitest";
+
+afterEach(() => cleanup());
+```
+
+**File: `frontend/src/vite-env.d.ts`**
+
+```typescript
+/// <reference types="vite/client" />
+
+interface ImportMetaEnv {
+  readonly VITE_USE_MOCK?: string;
+  readonly VITE_API_BASE_URL?: string;
+}
+```
+
+**File: `frontend/tsconfig.json`**
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "jsx": "react-jsx",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "isolatedModules": true,
+    "skipLibCheck": true,
+    "types": [
+      "node",
+      "vite/client",
+      "vitest/globals",
+      "@testing-library/jest-dom"
+    ]
+  },
+  "include": ["src", "e2e", "vite.config.ts", "playwright.config.ts"]
+}
+```
+
+**File: `frontend/vite.config.ts`**
+
+```typescript
+/// <reference types="vitest/config" />
+import react from "@vitejs/plugin-react";
+import { defineConfig } from "vite";
+
+export default defineConfig({
+  plugins: [react()],
+  server: {
+    // When VITE_API_BASE_URL is "/api", the dev server forwards calls to
+    // the FastAPI backend (Unit 5) and the browser sees one origin.
+    proxy: {
+      "/api": {
+        target: "http://127.0.0.1:8000",
+        rewrite: (path) => path.replace(/^\/api/, ""),
+      },
+    },
+  },
+  test: {
+    environment: "jsdom",
+    globals: true,
+    setupFiles: ["./src/test/setup.ts"],
+  },
+});
+```
+
+**File: `backend/tests/__init__.py`**
+
+```python
+
+```
+
+**File: `backend/tests/conftest.py`**
+
+```python
+from collections.abc import Iterator
+
+import pytest
+from fastapi.testclient import TestClient
+
+from app.config import Settings
+from app.main import create_app
+
+
+@pytest.fixture
+def client() -> Iterator[TestClient]:
+    settings = Settings(
+        env="test",
+        jwt_secret="test-secret-test-secret-test-secret!!",
+        database_url="sqlite://",
+        cors_origins=["http://localhost:5173"],
+        demo_users=(
+            "agent:agent-pw:agent,alice:alice-pw:requester,"
+            "bob:bob-pw:requester"
+        ),
+    )
+    with TestClient(create_app(settings)) as test_client:
+        yield test_client
+
+
+def auth(client: TestClient, user: str) -> dict[str, str]:
+    response = client.post(
+        "/auth/token", data={"username": user, "password": f"{user}-pw"}
+    )
+    assert response.status_code == 200, response.text
+    return {"Authorization": f"Bearer {response.json()['access_token']}"}
+```
+
+**File: `backend/tests/test_cross_cutting.py`**
+
+```python
+"""Frontend/backend coordination: request IDs, CORS, contract."""
+
+from fastapi.testclient import TestClient
+
+
+def test_request_id_is_echoed_or_generated(client: TestClient) -> None:
+    echoed = client.get("/health", headers={"X-Request-ID": "abc-123"})
+    assert echoed.headers["x-request-id"] == "abc-123"
+    generated = client.get("/health")
+    assert len(generated.headers["x-request-id"]) == 32
+
+
+def test_malicious_request_id_is_replaced(client: TestClient) -> None:
+    response = client.get(
+        "/health", headers={"X-Request-ID": "bad\nid with spaces"}
+    )
+    assert response.headers["x-request-id"] != "bad\nid with spaces"
+
+
+def test_error_body_carries_request_id(client: TestClient) -> None:
+    response = client.get(
+        "/tickets", headers={"X-Request-ID": "trace-me-1"}
+    )
+    assert response.json()["request_id"] == "trace-me-1"
+
+
+def test_cors_preflight_allows_spa_origin(client: TestClient) -> None:
+    response = client.options(
+        "/tickets",
+        headers={
+            "Origin": "http://localhost:5173",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "authorization,content-type",
+        },
+    )
+    assert response.status_code == 200
+    assert (
+        response.headers["access-control-allow-origin"]
+        == "http://localhost:5173"
+    )
+
+
+def test_cors_rejects_unknown_origin(client: TestClient) -> None:
+    response = client.options(
+        "/tickets",
+        headers={
+            "Origin": "https://evil.example",
+            "Access-Control-Request-Method": "GET",
+        },
+    )
+    assert "access-control-allow-origin" not in response.headers
+
+
+def test_contract_matches_frontend_expectations(client: TestClient) -> None:
+    """If a field the SPA relies on disappears, this fails in CI."""
+    schemas = client.get("/openapi.json").json()["components"]["schemas"]
+    ticket = set(schemas["TicketOut"]["properties"])
+    assert {
+        "id",
+        "title",
+        "description",
+        "priority",
+        "status",
+        "created_at",
+    } <= ticket
+    assert set(schemas["TicketCreate"]["properties"]) == {
+        "title",
+        "description",
+        "priority",
+    }
+```
+
+**File: `backend/tests/test_tickets_api.py`**
+
+```python
+"""Integration tests: real HTTP stack, real SQL (in-memory SQLite)."""
+
+from fastapi.testclient import TestClient
+
+from tests.conftest import auth
+
+
+def new_ticket(
+    client: TestClient, user: str, title: str = "Printer jam"
+) -> dict:
+    response = client.post(
+        "/tickets",
+        json={"title": title, "priority": "high"},
+        headers=auth(client, user),
+    )
+    assert response.status_code == 201, response.text
+    return response.json()
+
+
+def test_owner_comes_from_token_not_body(client: TestClient) -> None:
+    response = client.post(
+        "/tickets",
+        json={"title": "Hack", "owner": "bob"},
+        headers=auth(client, "alice"),
+    )
+    assert response.status_code == 422  # extra field rejected
+    ticket = new_ticket(client, "alice")
+    assert ticket["owner"] == "alice"
+
+
+def test_requesters_only_see_their_own_tickets(client: TestClient) -> None:
+    new_ticket(client, "alice", "Alice ticket")
+    bobs = new_ticket(client, "bob", "Bob ticket")
+
+    alice_view = client.get(
+        "/tickets", headers=auth(client, "alice")
+    ).json()
+    assert [t["title"] for t in alice_view["items"]] == ["Alice ticket"]
+
+    # Object-level authorization: guessing an ID does not work (404).
+    peek = client.get(
+        f"/tickets/{bobs['id']}", headers=auth(client, "alice")
+    )
+    assert peek.status_code == 404
+
+    agent_view = client.get(
+        "/tickets", headers=auth(client, "agent")
+    ).json()
+    assert agent_view["total"] == 2
+
+
+def test_only_agents_change_status(client: TestClient) -> None:
+    ticket = new_ticket(client, "alice")
+    path = f"/tickets/{ticket['id']}"
+    denied = client.patch(
+        path, json={"status": "closed"}, headers=auth(client, "alice")
+    )
+    assert denied.status_code == 403
+    assert denied.json()["title"] == "Forbidden"
+    ok = client.patch(
+        path, json={"status": "closed"}, headers=auth(client, "agent")
+    )
+    assert ok.status_code == 200
+    assert ok.json()["status"] == "closed"
+
+
+def test_filter_by_status(client: TestClient) -> None:
+    first = new_ticket(client, "alice", "One")
+    new_ticket(client, "alice", "Two")
+    client.patch(
+        f"/tickets/{first['id']}",
+        json={"status": "in_progress"},
+        headers=auth(client, "agent"),
+    )
+    page = client.get(
+        "/tickets?status=in_progress", headers=auth(client, "agent")
+    ).json()
+    assert [t["title"] for t in page["items"]] == ["One"]
+
+
+def test_validation_errors_are_problem_details(client: TestClient) -> None:
+    response = client.post(
+        "/tickets", json={"title": "ab"}, headers=auth(client, "alice")
+    )
+    assert response.status_code == 422
+    body = response.json()
+    assert body["errors"][0]["loc"] == ["body", "title"]
+    assert body["request_id"]
+
+
+def test_me_returns_role(client: TestClient) -> None:
+    me = client.get("/me", headers=auth(client, "agent")).json()
+    assert me == {"username": "agent", "role": "agent"}
+
+
+def test_unauthenticated_is_401_problem(client: TestClient) -> None:
+    response = client.get("/tickets")
+    assert response.status_code == 401
+    assert response.headers["www-authenticate"] == "Bearer"
+    assert response.json()["status"] == 401
+```
+
+
+### How to Run
+
+```bash
+# terminal 1
+cd projects/unit05-fullstack/solution/backend
+python3.12 -m venv .venv && source .venv/bin/activate
+pip install -r requirements-dev.txt && cp .env.example .env
+uvicorn app.main:create_app --factory --reload
+
+# terminal 2
+cd projects/unit05-fullstack/solution/frontend
+npm install && cp .env.example .env
+npm run dev            # http://localhost:5173
+
+# end to end (stops your dev servers first, or reuses them)
+npx playwright install chromium
+PYTHON=../backend/.venv/bin/python npm run e2e
+```
+
+### Verify the Solution
+
+1. Backend: **13 passed**, ruff and mypy clean.
+2. Frontend: **17 passed**, typecheck clean.
+3. E2E: **2 passed**.
+4. Manual: alice creates a ticket (dropdown disabled); bob does not see it; the agent closes it; alice filters "Closed" and sees it.
+5. Copy an `X-Request-ID` from DevTools and find it in the uvicorn log.
+6. With bob's token, `curl` alice's ticket ID: **404**.
+
+### Project Interview Debrief
+
+1. **Why 404 instead of 403 for other users' tickets?**
+   A 403 confirms the ticket exists, which leaks information (ticket IDs, volume, sometimes titles via other endpoints). 404 treats "not yours" as "not there". Agents get 403 for actions they can see but not perform.
+2. **Why is the role fetched from `/me` instead of decoded from the JWT in the browser?**
+   The server is the authority; decoding works but couples the SPA to the token format (which changes when you move to an IdP). Either way the UI only adapts; the API enforces.
+3. **How do you know the tiers stay compatible?**
+   The contract test in backend CI, generated or mirrored TS types with strict compilation, and one Playwright journey running the real servers.
+4. **Why does the dev setup use a proxy instead of CORS?**
+   Same origin removes preflights and cookie complexity, and mirrors the recommended production topology (CloudFront routing `/api`). CORS is still configured and tested for deployments that need separate origins.
+5. **What would you add for production?**
+   OIDC with an IdP and JWKS verification, Alembic migrations, Postgres with row-level security as defense in depth, rate limiting on login, OpenTelemetry traces, containerized deploy with health checks (Unit 6) and CI running all three test layers (Unit 7).
