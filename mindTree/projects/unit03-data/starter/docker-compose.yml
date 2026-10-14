@@ -1,0 +1,18 @@
+services:
+  db:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: orders
+      POSTGRES_PASSWORD: orders
+      POSTGRES_DB: orders
+    ports: ["5432:5432"]
+    volumes: ["pgdata:/var/lib/postgresql"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orders"]
+      interval: 5s
+      retries: 10
+  redis:
+    image: redis:8
+    ports: ["6379:6379"]
+volumes:
+  pgdata:

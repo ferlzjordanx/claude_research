@@ -4217,3 +4217,2575 @@ pytest -q
    Containerize (Unit 6), with configuration and secrets from the environment via a secret manager. Run several replicas behind a load balancer, with health probes and CI/CD with tests (Unit 7).
 5. **Why return 409 for a duplicate email instead of 400 or 422?**
    The request is valid on its own but conflicts with the current server state. That's exactly what 409 means, and it tells the client the problem is the data, not the format.
+
+
+# Unit 3 — Data Engineering for Application Developers
+
+## 1. What This Unit Teaches
+
+Every FDE system stores and retrieves data, and data mistakes are the most expensive to fix later **[JD-Required]**. This unit teaches:
+
+- relational modeling and SQL on PostgreSQL;
+- keys and constraints as executable business rules;
+- joins, indexes and how to read a query plan;
+- transactions and isolation levels, and the concurrency bugs they prevent;
+- connection pooling;
+- SQLAlchemy 2.x (Core and ORM, the session, N+1);
+- migrations with Alembic;
+- NoSQL options (document, key-value / Redis) and how to choose between SQL and NoSQL.
+
+The emphasis is on what an application developer must get right, not database administration.
+
+## 2. Mental Model
+
+```text
+ Application (FastAPI route → service)
+     │  calls
+     ▼
+ Repository              builds SQL (via SQLAlchemy), returns objects
+     │  borrows a connection
+     ▼
+ Connection Pool         reuses N open connections (TCP+TLS+auth
+     │                   are expensive to create)
+     ▼
+ Database (PostgreSQL)
+     │  planner chooses:  Index scan?  Seq scan?  Join strategy?
+     ▼
+ Index / Query           B-tree lookup vs reading the whole table
+     │
+     ▼
+ Transaction             BEGIN … COMMIT | ROLLBACK
+     │                   isolation decides what concurrent
+     │                   transactions can see
+     ▼
+ Result                  rows → ORM objects → Pydantic → JSON
+```
+
+Read it as follows:
+
+- The application never talks to the database directly. It goes through a repository, which borrows a pooled connection.
+- The database decides *how* to execute each query (the plan). Indexes give the planner faster options.
+- Transactions group statements so they succeed or fail together.
+- Isolation decides what concurrent transactions can see of each other's work.
+
+## 3. Brief Theory
+
+### 3.1 Relational databases and SQL
+
+**What it is.**
+
+- A relational database stores data in **tables** (relations) of rows with typed columns. Relationships are expressed by **keys**.
+- **SQL** is declarative: you describe *what* you want and the planner decides *how* to get it.
+- **PostgreSQL** is the open-source default for application data. It has strong correctness (MVCC, real constraints, transactional DDL) and rich types (JSONB, arrays, ranges, full text). Extensions such as `pgvector` (Unit 10) add more.
+
+**Why it matters.** Relational databases enforce integrity rules for *every* writer, answer ad-hoc questions with joins and aggregates, and give transactional guarantees that business data (orders, payments, inventory) requires.
+
+**Essential SQL:**
+
+```sql
+-- Join + aggregate: revenue per customer in 2026
+SELECT c.id, c.name, SUM(o.total) AS revenue, COUNT(*) AS orders
+FROM customers c
+JOIN orders o ON o.customer_id = c.id
+WHERE o.created_at >= '2026-01-01'
+GROUP BY c.id, c.name
+HAVING SUM(o.total) > 1000
+ORDER BY revenue DESC
+LIMIT 10;
+
+-- LEFT JOIN keeps customers with no orders (orders = 0)
+SELECT c.id, COUNT(o.id) AS orders
+FROM customers c LEFT JOIN orders o ON o.customer_id = c.id
+GROUP BY c.id;
+
+-- Window function: each customer's latest order
+SELECT * FROM (
+  SELECT o.*, ROW_NUMBER() OVER (PARTITION BY customer_id
+                                 ORDER BY created_at DESC) AS rn
+  FROM orders o) t
+WHERE rn = 1;
+```
+
+| Join | Returns |
+|---|---|
+| INNER JOIN | Only rows that match in both tables |
+| LEFT JOIN | All left rows; NULLs where the right side has no match |
+| FULL OUTER JOIN | All rows from both sides |
+| CROSS JOIN | Every combination (rarely intended) |
+
+### 3.2 Schema design, primary and foreign keys, constraints
+
+**What it is.** Choosing tables, columns, types and constraints so that the data is correct by construction.
+
+**How to do it.**
+
+- **Primary key (PK).** It uniquely identifies a row. Use surrogate keys (`bigint` identity or UUIDv7) for entities, and keep natural keys (email, SKU) as `UNIQUE` constraints.
+- **Foreign key (FK).** It guarantees a referenced row exists (`orders.customer_id → customers.id`). Choose `ON DELETE` deliberately:
+  - `RESTRICT` — you can't delete a customer who has orders;
+  - `CASCADE` — deleting an order deletes its items;
+  - `SET NULL`.
+- **CHECK, NOT NULL and UNIQUE** turn business rules into guarantees (`stock >= 0`, `quantity > 0`). Application checks can race; constraints cannot.
+- **Normalization.** Store each fact once (third normal form) to avoid update anomalies. **Denormalize** deliberately for read performance, and document who keeps the copies consistent.
+- **Types.**
+  - `numeric(12,2)` for money (never float);
+  - `timestamptz` for instants (store UTC);
+  - `text` or `varchar(n)` with validation;
+  - `jsonb` for genuinely flexible attributes, not as a way to avoid design.
+
+**Why it matters for an FDE.** Customers' data arrives messy. The schema is where you decide what is authoritative and what is guaranteed.
+
+### 3.3 Indexes
+
+**What it is.** An index is an auxiliary data structure — by default a **B-tree**, sorted and balanced — that lets the database find rows without scanning the whole table.
+
+**How it works.**
+
+- A B-tree lookup is O(log n) and can also return rows already *in index order*, which avoids a sort.
+- **Composite indexes** follow the leftmost-prefix rule. `(customer_id, created_at)` serves `WHERE customer_id = ? ORDER BY created_at`, but not `WHERE created_at > ?` alone.
+- **Covering indexes** (`INCLUDE (...)`) let index-only scans avoid reading the table.
+- **Partial indexes** (`WHERE status = 'open'`) index only hot rows.
+- **GIN indexes** serve JSONB, arrays and full-text search; pgvector adds ANN indexes for embeddings (Unit 10).
+
+**Trade-offs.** Every index:
+
+- costs storage;
+- slows every `INSERT`, `UPDATE` and `DELETE`, because the index must be maintained;
+- adds planner work.
+
+Index for your real query patterns, measured with `EXPLAIN ANALYZE`. Unique constraints create indexes automatically.
+
+### 3.4 Query behavior and query plans
+
+`EXPLAIN` shows the plan. `EXPLAIN (ANALYZE, BUFFERS)` runs the query and shows actual times and pages touched. This is real output from the project's `scripts/explain_demo.py` on 500,000 orders:
+
+```text
+--- BEFORE index ---
+Limit (actual time=10.259..13.248 rows=20 loops=1)
+  ->  Gather Merge (actual time=10.257..13.244 rows=20 loops=1)
+        Workers Planned: 2
+        ->  Sort  Sort Key: created_at DESC
+              ->  Parallel Seq Scan on demo_orders
+                    Filter: (customer_id = 4242)
+                    Rows Removed by Filter: 166649
+Execution Time: 13.267 ms
+--- AFTER index (customer_id, created_at DESC) ---
+Limit (actual time=0.027..0.051 rows=20 loops=1)
+  ->  Index Scan using ix_demo_customer_created on demo_orders
+        Index Cond: (customer_id = 4242)
+Execution Time: 0.065 ms
+```
+
+**How to read it:**
+
+- **Before:** a sequential scan read every row (about 500,000 discarded by the filter), then sorted. That cost grows with table size.
+- **After:** the index finds the customer's rows already sorted by date and stops after 20. That is roughly 200× faster, and it stays fast as the table grows.
+
+**Red flags in plans:**
+
+- `Seq Scan` on a large table for a selective filter;
+- `Rows Removed by Filter` in the hundreds of thousands;
+- an explicit `Sort` you could avoid;
+- `Nested Loop` with huge row estimates;
+- estimated rows far from actual rows, which means stale statistics (run `ANALYZE`).
+
+**Common causes of slow queries:**
+
+- a missing or unusable index (a function on the column, a type mismatch, a leading wildcard such as `LIKE '%x'`);
+- N+1 queries from the ORM;
+- `SELECT *` over wide rows;
+- OFFSET pagination deep into a table.
+
+### 3.5 Transactions (ACID)
+
+**What it is.** A transaction groups statements into one unit:
+
+| Property | Meaning |
+|---|---|
+| **Atomicity** | All statements apply or none do |
+| **Consistency** | Constraints hold before and after |
+| **Isolation** | Concurrent transactions don't see each other's partial work |
+| **Durability** | Committed data survives crashes (write-ahead log) |
+
+**Why it matters.** Placing an order touches several rows: decrement stock, insert the order, insert its items. A failure halfway must not leave stock decremented with no order.
+
+**In SQLAlchemy:**
+
+```python
+with session.begin():          # BEGIN
+    ...                        # any exception → ROLLBACK
+                               # normal exit → COMMIT
+```
+
+### 3.6 Isolation levels and concurrency anomalies
+
+| Level | Prevents | Still possible | PostgreSQL notes |
+|---|---|---|---|
+| Read Committed (**PG default**) | Dirty reads | Non-repeatable reads, phantoms, **lost updates** with read-modify-write | Each *statement* sees the latest committed data |
+| Repeatable Read | + non-repeatable reads, phantoms (snapshot) | Write skew | The transaction sees one snapshot; conflicting writes raise a serialization error, so retry |
+| Serializable (SSI) | All anomalies | — | May abort transactions; the application must retry |
+
+**The classic bug — lost update (read-modify-write race):**
+
+```text
+T1: SELECT stock → 1         T2: SELECT stock → 1
+T1: UPDATE stock = 0         T2: UPDATE stock = 0
+→ two orders sold the last unit
+```
+
+**Three correct fixes:**
+
+1. **Atomic conditional update.** Check and write in *one* statement. This is what the project does:
+
+   ```sql
+   UPDATE products SET stock = stock - :q
+   WHERE sku = :sku AND stock >= :q
+   RETURNING id, price;            -- no row ⇒ insufficient stock
+   ```
+
+2. **Pessimistic locking.** `SELECT ... FOR UPDATE` locks the row until commit, so other writers wait.
+3. **Optimistic locking.** A `version` column: `UPDATE ... SET version = version + 1 WHERE id = ? AND version = ?`. Zero rows updated means someone else changed it, so return 409 or retry.
+
+**Deadlocks** happen when two transactions lock rows in opposite orders. Lock in a **consistent order** (the project sorts SKUs), keep transactions short, and retry on deadlock errors.
+
+### 3.7 Connection pooling
+
+**What it is.** A set of reusable open database connections.
+
+**Why it exists.** Opening a PostgreSQL connection costs a TCP handshake, TLS, authentication and a backend process (several milliseconds, plus memory on the server). Doing that per request is slow, and many clients can exhaust `max_connections`.
+
+**How it works.**
+
+- SQLAlchemy's `QueuePool` keeps `pool_size` connections and allows `max_overflow` extras. `pool_timeout` bounds the wait, and `pool_pre_ping` discards dead connections.
+- **Capacity math:** total connections = replicas × workers × (pool_size + max_overflow). Ten pods × 2 workers × 15 = 300 connections, which may exceed the database limit.
+- Use an external pooler (**PgBouncer**, **RDS Proxy**) for many clients or serverless workloads.
+
+**Symptoms of exhaustion:**
+
+- requests hang, then time out with `QueuePool limit ... reached`;
+- sessions are not closed (always use a `yield` dependency or a context manager);
+- long transactions hold connections.
+
+### 3.8 SQLAlchemy 2.x
+
+**What it is.** The standard Python database toolkit.
+
+- **Core:** a SQL expression language (`select`, `update`), engines, connections.
+- **ORM:** maps classes to tables, with a **Session** that implements the *unit of work* (tracks changes, flushes them in order) and an *identity map* (one object per row per session).
+
+**[Current: 2.0-style API — `select()`, `Mapped[...]`, `mapped_column`. The 1.x `session.query()` style is legacy but still widely seen. 2.1 is current and keeps the 2.0 API.]**
+
+**Key mechanics:**
+
+- `session.add()` stages an object. `flush()` sends the SQL without committing, so an id becomes available. `commit()` makes it durable.
+- **Lazy loading:** accessing `order.items` triggers a query. In a loop over N orders that is **N+1 queries**. Fix it with eager loading:
+  - `selectinload` — one extra `IN` query per relationship;
+  - `joinedload` — a JOIN, suited to many-to-one.
+- `expire_on_commit=False` keeps objects readable after commit. That is convenient in APIs, but you must reload deliberately when you need fresh data.
+- Sync sessions block. Use them from `def` FastAPI endpoints (which run in the threadpool), or use `AsyncSession` with `asyncpg` or `psycopg` async, with `async def` throughout.
+
+### 3.9 Migrations
+
+**What it is.** Versioned, ordered scripts that evolve the schema (Alembic for SQLAlchemy).
+
+**Why it exists.** Every environment (developer laptops, CI, staging, production) must reach the same schema reproducibly, with a reviewed history and a downgrade path.
+
+**How to use it:**
+
+- `alembic revision --autogenerate -m "msg"` compares the models with the database and writes a draft. **Always review it**: autogenerate can't infer renames and may miss some constraints.
+- `alembic upgrade head` runs as a **deploy step** (a CI/CD job or a Kubernetes init Job), not at application import time.
+- **Zero-downtime changes** use *expand/contract*:
+  1. add the new nullable column;
+  2. deploy code that writes both columns;
+  3. backfill;
+  4. switch reads;
+  5. drop the old column in a later release.
+- Build large indexes with `CREATE INDEX CONCURRENTLY` to avoid locking writes.
+
+### 3.10 NoSQL
+
+**What it is.** A family of non-relational stores, each optimized for specific access patterns:
+
+| Type | Examples | Model | Strengths | Weaknesses |
+|---|---|---|---|---|
+| Document | MongoDB, Amazon DocumentDB, Firestore, Cosmos DB | JSON documents, nested | Flexible schema, aggregate-oriented reads, horizontal scaling | Cross-document joins and transactions are limited or costly; duplication must be managed |
+| Key-value | Redis/Valkey, DynamoDB (also wide-column-like) | Key → value | Very fast lookups at massive scale, TTLs | Queries limited to known keys or indexes; design around access patterns |
+| Wide-column | Cassandra, ScyllaDB | Partitioned rows | Huge write throughput, multi-region | Query-first modeling, eventual consistency |
+| Search | OpenSearch, Elasticsearch | Inverted index | Full-text, relevance, aggregations | Not a system of record |
+| Graph | Neo4j, Neptune | Nodes and edges | Relationship traversal | Niche |
+| Vector | pgvector, OpenSearch k-NN, Pinecone | Embeddings | Similarity search (RAG) | Approximate; needs metadata filtering |
+
+**Document database example (MongoDB, pymongo):**
+
+```python
+from pymongo import MongoClient, ASCENDING
+
+client = MongoClient("mongodb://localhost:27017",
+                     serverSelectionTimeoutMS=2000)
+orders = client.shop.orders
+orders.create_index([("customer_id", ASCENDING), ("created_at", -1)])
+orders.insert_one({
+    "customer_id": 1,
+    "status": "placed",
+    "items": [{"sku": "KB-01", "qty": 2, "unit_price": "89.00"}],
+    "shipping": {"city": "Austin", "zip": "78701"},  # embedded, not joined
+})
+recent = orders.find({"customer_id": 1}).sort("created_at", -1).limit(20)
+```
+
+The order *with its items* is one document because it is always read together. This is aggregate-oriented modeling. The cost is that product names copied into items can go stale, which is a deliberate denormalization.
+
+**DynamoDB** **[Provider-specific, AWS]**. Design the partition key and sort key from the access patterns (`PK=CUSTOMER#1`, `SK=ORDER#2026-10-14#123`), and add Global Secondary Indexes for other patterns. Reads are eventually consistent by default.
+
+### 3.11 Redis
+
+**What it is.** An in-memory data-structure server: strings, hashes, lists, sets, sorted sets and streams, with TTLs.
+
+**Uses in FDE systems:**
+
+- **cache-aside** for hot reads;
+- rate limiting (`INCR` plus `EXPIRE`);
+- distributed locks (with care);
+- session storage;
+- idempotency-key storage (Unit 8);
+- lightweight queues and streams.
+
+**Cache-aside:**
+
+```text
+read:  value = cache.get(k) → hit? return
+                            → miss? value = db.get(); cache.set(k, ttl)
+write: db.update(); then cache.delete(k)   # after COMMIT
+```
+
+**Pitfalls and fixes:**
+
+| Pitfall | What goes wrong | Fix |
+|---|---|---|
+| **Stale data** | Readers see old values | Invalidate after commit; short TTLs |
+| **Stampede** | Many concurrent misses hit the database at once | Locks, request coalescing, or jittered TTLs |
+| **Cache as a single point of failure** | A Redis outage breaks reads | Treat Redis errors as misses (the project does this) |
+| **Unbounded memory** | Redis fills up | `maxmemory` plus an eviction policy |
+
+### 3.12 SQL vs NoSQL: how to choose
+
+| Question | Lean relational (PostgreSQL) | Lean NoSQL |
+|---|---|---|
+| Do you need multi-row/multi-entity transactions? | Yes (orders, payments, inventory) | Rarely |
+| Are queries ad-hoc or evolving (reports, analytics, joins)? | Yes | No, the access patterns are known and fixed |
+| Is the data shape stable with relationships? | Yes | Highly variable or nested aggregates |
+| Scale | Vertical plus read replicas covers most apps | Massive write throughput or global distribution |
+| Team skills and operations | SQL is ubiquitous | Managed services reduce operational work |
+
+The **FDE default** is PostgreSQL as the system of record, Redis for cache and ephemeral state, and a search or vector index derived from the system of record. Add a document store when the access pattern clearly fits it.
+
+## 4. Application in a Real System
+
+```text
+ FastAPI ──► Service ──► Repository ──► SQLAlchemy Session
+                │                             │ pool
+                │ cache-aside                 ▼
+                └──► Redis (ElastiCache)   PostgreSQL (RDS/Aurora)
+                                              │ logical replication / CDC
+                                              ▼
+                           Search/Vector index, data warehouse
+                           (derived, rebuildable — not authoritative)
+```
+
+| Choice | Why | Without it | Alternatives |
+|---|---|---|---|
+| PostgreSQL (RDS / Aurora) | Integrity, transactions, rich SQL, managed backups and failover | Data corruption, hand-written consistency logic | MySQL (similar); DynamoDB (scale, access-pattern design) |
+| SQLAlchemy ORM + Core | Productivity plus full SQL when needed | Hand-written SQL everywhere, or an ORM hiding SQL behind magic | Raw psycopg (more control), SQLModel (thin layer over SQLAlchemy + Pydantic) |
+| Alembic | Reproducible schema history | "Works on my machine" schemas | Flyway / Liquibase (JVM ecosystem) |
+| Redis cache | Cuts read latency and database load | Database overload on hot keys | In-process cache (per-replica, inconsistent), CDN for public data |
+| Constraints in the database | Rules enforced for every writer | Race conditions, bad data from scripts | Application-only validation (insufficient) |
+
+## 5. Implementation
+
+### 5.1 Typed ORM models with constraints and an index
+
+```python
+class Product(Base):
+    __tablename__ = "products"
+    __table_args__ = (
+        CheckConstraint("stock >= 0", name="ck_products_stock_nonneg"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    sku: Mapped[str] = mapped_column(String(40), unique=True)
+    price: Mapped[Decimal] = mapped_column(Numeric(10, 2))
+    stock: Mapped[int] = mapped_column(default=0)
+
+
+class Order(Base):
+    __tablename__ = "orders"
+    __table_args__ = (
+        Index("ix_orders_customer_created", "customer_id", "created_at"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    customer_id: Mapped[int] = mapped_column(
+        ForeignKey("customers.id", ondelete="RESTRICT"))
+    items: Mapped[list["OrderItem"]] = relationship(
+        back_populates="order", cascade="all, delete-orphan")
+```
+
+### 5.2 Engine, pool and a per-request session
+
+```python
+engine = create_engine(url, pool_size=5, max_overflow=10,
+                       pool_pre_ping=True, pool_timeout=10)
+factory = sessionmaker(engine, expire_on_commit=False)
+
+
+def get_session(request: Request) -> Iterator[Session]:
+    session = factory()
+    try:
+        yield session          # FastAPI injects this
+    finally:
+        session.close()        # connection returns to the pool
+```
+
+### 5.3 A transaction with an atomic, race-free stock decrement
+
+```python
+with session.begin():                       # COMMIT or ROLLBACK
+    for sku in sorted(quantities):          # consistent lock order
+        row = session.execute(
+            update(Product)
+            .where(Product.sku == sku, Product.stock >= quantities[sku])
+            .values(stock=Product.stock - quantities[sku])
+            .returning(Product.id, Product.price)
+        ).one_or_none()
+        if row is None:                     # raising → ROLLBACK
+            raise InsufficientStockError(sku)
+        ...
+    session.add(order)
+cache.delete(*keys)                         # after COMMIT
+```
+
+### 5.4 Avoiding N+1 with eager loading
+
+```python
+stmt = (select(Order)
+        .where(Order.customer_id == customer_id)
+        .order_by(Order.created_at.desc())
+        .limit(20)
+        .options(selectinload(Order.items)
+                 .selectinload(OrderItem.product)))
+orders = session.scalars(stmt).all()        # 3 queries total
+```
+
+The project's test counts the SQL statements with an engine event listener and asserts exactly three. That turns a performance property into a regression test.
+
+### 5.5 Letting the database enforce uniqueness
+
+```python
+try:
+    with session.begin():
+        session.add(Customer(name=..., email=email))
+except IntegrityError as exc:               # UNIQUE violated
+    raise ConflictError("Email already registered.") from exc
+```
+
+### 5.6 Cache-aside that survives a Redis outage
+
+```python
+def get(self, key: str) -> dict | None:
+    try:
+        raw = self._client.get(key)
+    except redis.RedisError as exc:          # outage = cache miss
+        log.warning("cache get failed: %s", exc)
+        return None
+    return json.loads(raw) if raw else None
+```
+
+### 5.7 Migrations
+
+```bash
+alembic revision --autogenerate -m "initial schema"   # draft
+# review alembic/versions/0001_initial_schema.py
+alembic upgrade head          # apply
+alembic downgrade -1          # roll back one step
+alembic history               # audit trail
+```
+
+## 6. How It Connects to the Rest of the System
+
+```text
+ Unit 2 API ─► service ─► repository (this unit) ─► pool ─► PostgreSQL
+                 │                                      ▲
+                 └─► Redis cache ◄────── invalidation ──┘
+ Unit 6: RDS/Aurora + ElastiCache, secrets for DB credentials,
+         readiness probe runs SELECT 1, migration Job before rollout
+ Unit 7: CI runs migrations + tests against a real Postgres service
+ Unit 8: idempotency keys and outbox tables live in this database
+ Unit 10: pgvector stores embeddings next to authoritative records
+ Unit 11: slow-query logs, pool metrics, DB spans in traces
+```
+
+## Cross-Unit System Map (Units 1–3)
+
+```text
+ Client (curl / Swagger UI / future SPA)
+   │ HTTPS + JSON + Bearer JWT
+   ▼
+ FastAPI app (Unit 2)
+   ├─ Pydantic validation at the boundary
+   ├─ authN (JWT) → authZ (roles)
+   ▼
+ Service layer (Unit 2) — business rules, domain errors
+   │  typed Python, Protocols, exceptions, tests (Unit 1)
+   ▼
+ Repository (Unit 3) — SQLAlchemy 2.x
+   ├─ connection pool
+   ├─ transactions (atomic stock decrement)
+   ▼
+ PostgreSQL (constraints, indexes)      Redis (cache-aside)
+```
+
+Everything in this map is **deterministic**: the same input produces the same output, and correctness is enforced by types, validation, constraints and transactions. Later units add network failures (Unit 8) and probabilistic model behavior (Units 9–10) *around* this deterministic core. They never replace it.
+
+## FDE Scenario 2 — "The numbers in the dashboard don't match the ERP"
+
+**Stakeholder:** "Your new order dashboard shows 4% more revenue than our ERP. Finance is upset. Fix it today."
+
+- *Clarify first:*
+  - Which numbers (gross or net, with or without tax, refunds, currency)?
+  - Which period and time zone ("today" in UTC or in local time)?
+  - Which system is **authoritative** for revenue? Usually the ERP or ledger, not your operational database.
+- *Investigate with evidence:*
+  - reconcile one day order by order (`FULL OUTER JOIN` of both extracts on order ID);
+  - classify the differences: missing refunds, duplicated orders from retries, time-zone boundary, currency conversion.
+- *Likely causes:*
+  - retries created duplicate orders (no idempotency key, Unit 8);
+  - cancelled orders counted;
+  - `created_at` stored without a time zone.
+- *What must be deterministic:* the revenue definition, written down as an acceptance criterion with a SQL query both sides agree on.
+- *Deliver:* a reconciliation report, a fix (unique constraint plus idempotency keys; a status filter), a regression test using the reconciliation query, and a short note to finance explaining the definition.
+- *Communicate:* "Here's the exact cause for each difference, the fix, and the check we'll run daily so this can't recur silently."
+
+## Comprehension Questions
+
+1. Why should "stock can't go negative" be a database CHECK constraint even if the service already checks it?
+2. A composite index on `(customer_id, created_at)` exists. Which of these does it help, and why: (a) `WHERE customer_id=7 ORDER BY created_at DESC`, (b) `WHERE created_at > now() - '1 day'`?
+3. Why might an index improve one query but hurt write performance?
+4. Explain the lost-update race, and two ways to prevent it.
+5. What is the N+1 problem and how does `selectinload` fix it?
+6. Why use a connection pool, and how can it be exhausted?
+7. Why must cache invalidation happen after the transaction commits?
+8. When would you choose a document database over PostgreSQL?
+
+## Comprehension Answers
+
+1. Application checks can race between concurrent requests and are bypassed by other writers (scripts, other services). The constraint is enforced atomically for every write.
+2. (a) Yes. The leftmost column matches the equality filter and the second column provides the sort order, so it is an index scan with no sort. (b) Not efficiently: `created_at` is not the leftmost column. It needs its own index.
+3. Reads can use it to avoid scans. Every INSERT, UPDATE or DELETE must also update the index, which costs CPU, I/O, WAL and storage.
+4. Two transactions read the same value, then both write a value derived from that stale read, and one update is lost. Prevent it with an atomic conditional `UPDATE ... WHERE stock >= q`, `SELECT ... FOR UPDATE`, or optimistic locking with a version column.
+5. Loading N parents and then lazily loading each parent's children issues 1 + N queries. `selectinload` loads all the children in one `IN (...)` query per relationship.
+6. Creating connections is slow and limited by the database's `max_connections`. A pool reuses them. It is exhausted when sessions leak, transactions are long, or replicas × pool size exceeds what the database or traffic allows.
+7. If you invalidate before commit, a concurrent reader can repopulate the cache with the old committed value, which is then stale until the TTL expires.
+8. When data is naturally read and written as self-contained aggregates with flexible or nested shape, the access patterns are known, and cross-entity transactions or joins are rare — and when horizontal scale or a managed serverless model matters.
+
+## Interview Questions — Theory-Based
+
+**Q1. Explain ACID and give an example where atomicity matters.**
+
+- *Strong answer:* Atomicity means all statements apply or none do. Consistency means constraints hold. Isolation means concurrent transactions don't see partial work. Durability means committed data survives crashes, via the WAL. Example: placing an order decrements stock and inserts the order and its items. If the item insert fails, the stock decrement must roll back.
+- *Testing:* the fundamentals beyond acronyms.
+- *Follow-up:* "How do you make an operation atomic across two services?" (You can't with one database transaction. Use a saga or the outbox pattern; see Unit 8.)
+
+**Q2. What isolation level does PostgreSQL use by default, and what anomalies can occur?**
+
+- *Strong answer:* Read Committed. Each statement sees data committed before that statement started, so non-repeatable reads, phantoms and lost updates in read-modify-write code are possible. I prevent them with atomic updates or row locks, or use Repeatable Read or Serializable with retry logic when needed.
+- *Follow-up:* "What does Serializable cost?" (Possible serialization failures that need retries, and some overhead.)
+
+**Q3. How do you find and fix a slow query?**
+
+- *Strong answer:*
+  1. Identify it from slow-query logs, `pg_stat_statements` or APM traces.
+  2. Run `EXPLAIN (ANALYZE, BUFFERS)` and look for sequential scans on selective filters, large "rows removed", sorts and bad estimates.
+  3. Fix: add or adjust an index (column order matters), rewrite the query, avoid functions on indexed columns, fix N+1 in the ORM, update statistics, use keyset pagination.
+  4. Verify with the same plan and with production-like data.
+- *Follow-up:* "When would you not add an index?" (Write-heavy tables, low-selectivity columns, queries that touch most rows.)
+
+**Q4. Explain connection pooling and how you'd size it.**
+
+- *Strong answer:* A pool keeps reusable connections because creating one is expensive. Size it from concurrency needs and database limits: replicas × workers × (pool_size + overflow) must stay under `max_connections` with headroom. Add PgBouncer or RDS Proxy for many clients. Watch pool wait time, in-use connections and timeouts.
+
+**Q5. ORM vs raw SQL: trade-offs?**
+
+- *Strong answer:* An ORM gives productivity, type-safe models, the unit of work and portability. The risks are hidden queries (N+1) and inefficient SQL. Raw SQL gives full control and performance. SQLAlchemy lets me mix them: ORM for CRUD, Core or text for complex reports. Either way I read the generated SQL and the plans.
+
+**Q6. How do you run schema migrations without downtime?**
+
+- *Strong answer:* Use expand/contract. Make additive changes first (nullable columns, new tables), deploy code compatible with both schemas, backfill in batches, switch reads, then remove the old structures in a later release. Use `CREATE INDEX CONCURRENTLY`, avoid long locks, and run migrations as a separate deploy step with a rollback plan.
+
+**Q7. SQL vs NoSQL for an order system?**
+
+- *Strong answer:* Orders, payments and inventory need multi-entity transactions and constraints, so PostgreSQL is the system of record. Redis serves caching and rate limits. A document store or DynamoDB fits huge, simple key-based access such as session data or an event log by customer. Search and vector indexes are derived, not authoritative.
+
+**Q8. What is cache-aside and what can go wrong?**
+
+- *Strong answer:* Read from the cache; on a miss, load from the database and populate the cache with a TTL; on a write, update the database and then delete the key. What can go wrong: stale data (invalidation timing), stampedes on popular keys, cache outages taking down reads (treat errors as misses), unbounded memory, and caching per-user data under shared keys (a security leak).
+
+## Interview Questions — Application / Experience-Based
+
+**A1. Tell me about a schema you designed.**
+
+- *Cover:* the entities and their relationships, keys and constraints, indexes chosen from the query patterns, how it evolved (migrations), and one trade-off (normalize vs denormalize, JSONB vs columns).
+- *Structure:* Situation → Requirement → Architecture → Implementation → Verification → Result → Lesson.
+- *Personalize:* "`<<personalize: domain>>`. Core tables were `<<...>>`, with FKs and a unique constraint on `<<natural key>>`. The hot query `<<...>>` got a composite index `<<...>>`, verified with EXPLAIN ANALYZE (`<<before → after>>`)."
+- *Follow-ups:* "What would you change now?" "How did you handle a breaking change?"
+
+**A2. Describe a performance problem caused by the database.**
+
+- *Cover:* the symptom (latency or CPU), the evidence (plans, `pg_stat_statements`, traces), the root cause (missing index, N+1, lock contention), the fix and the measured result.
+
+**A3. Have you dealt with concurrency or data-integrity bugs?**
+
+- *Cover:* the race you found, how you reproduced it (a concurrency test), and the fix (atomic update, lock, constraint, idempotency).
+- *Lab-honest version:* "In a project I wrote a test that fires eight concurrent purchases at the last unit; with an atomic conditional UPDATE exactly one succeeds."
+
+**A4. How have you used Redis or another cache?**
+
+- *Cover:* what you cached and why, TTL and invalidation, failure behavior, and measured impact.
+
+**A5. Tell me about a data migration you ran.**
+
+- *Cover:* the planning, batching, verification counts and checksums, rollback, and communication.
+
+## Troubleshooting Scenarios
+
+**T1. A database query suddenly becomes slow.**
+
+```text
+SYMPTOM     /customers/{id}/orders p95 from 30ms to 3s
+WHAT TO CHECK  EXPLAIN ANALYZE now vs before; row count growth;
+               recent deploy (new filter/sort?); stats freshness;
+               lock waits (pg_stat_activity, pg_locks)
+LIKELY CAUSES  index not used (type mismatch, function on column,
+               changed ORDER BY), stale statistics, table bloat, N+1
+               after a code change, lock contention from a migration
+HOW TO CONFIRM plan shows Seq Scan + Sort; ANALYZE fixes estimates;
+               query count per request in traces
+FIX         add/adjust composite index; ANALYZE; eager loading;
+            rewrite query; CREATE INDEX CONCURRENTLY in prod
+PREVENTION  pg_stat_statements review, query-count tests, load tests
+            with realistic data volumes
+```
+
+*Strong answer:* "I'd compare the current plan with the expected one. Most sudden slowdowns are a plan change (stats or data growth), an index the query can no longer use, or N+1 introduced by a code change. I'd verify the fix with EXPLAIN ANALYZE and protect it with a test."
+
+**T2. Requests hang with "QueuePool limit reached".**
+
+```text
+CHECK       sessions closed? long transactions? replica × pool size
+            vs max_connections? slow queries holding connections?
+CAUSES      session leak (no close), awaiting an external API while
+            holding a transaction, traffic spike
+FIX         yield-dependency closes sessions; keep transactions short
+            (no network calls inside); tune pool; add PgBouncer/RDS
+            Proxy; set pool_timeout to fail fast
+```
+
+**T3. Duplicate rows appear after an outage.**
+
+```text
+CAUSE       client retried POST after timeout; no unique constraint /
+            idempotency key → second insert succeeded
+FIX         unique business key or Idempotency-Key table; dedupe data
+PREVENT     every create endpoint idempotent (Unit 8)
+```
+
+**T4. Deadlock detected errors under load.**
+
+```text
+CAUSE       two transactions lock the same rows in opposite order
+FIX         lock in a consistent order (sort keys), shorter
+            transactions, retry on deadlock (SQLSTATE 40P01)
+```
+
+**T5. A migration locks a production table.**
+
+```text
+CAUSE       ALTER TABLE adding NOT NULL with default on old PG / index
+            built without CONCURRENTLY / long-running transaction
+FIX         expand/contract; CONCURRENTLY; lock_timeout; off-peak
+```
+
+## Unit Practice Project — Orders Data Layer
+
+### Project Goal
+
+Build the persistence layer of an order system on SQLAlchemy 2.x and PostgreSQL:
+
+- a schema with real constraints and indexes;
+- migrations;
+- repositories;
+- a transactional, race-free order placement;
+- N+1-free reads;
+- a Redis cache that degrades gracefully.
+
+This proves you can make data correct under concurrency and fast under load, and prove both with tests.
+
+### Architecture
+
+```text
+ FastAPI (sync def endpoints, threadpool)
+   ├─ POST /customers ─► CustomerRepository ──┐
+   ├─ GET  /products/{sku} ─► CatalogService ─┼─► Session ─► pool ─► DB
+   │                           └─ cache-aside ─► Redis / in-memory
+   ├─ POST /orders ─► OrderService (one transaction, atomic UPDATE)
+   └─ GET  /customers/{id}/orders ─► OrderRepository (selectinload)
+ Alembic migrations ──► schema    scripts/explain_demo.py ──► plans
+```
+
+### Requirements
+
+1. Tables `customers`, `products`, `orders` and `order_items`, with:
+   - PKs and FKs (`RESTRICT` on customer, `CASCADE` on items);
+   - `UNIQUE(email)`, `UNIQUE(sku)`;
+   - `CHECK(stock >= 0)`, `CHECK(price > 0)`, `CHECK(quantity > 0)`;
+   - an index `(customer_id, created_at)`.
+2. `POST /customers` returns 201. A duplicate email returns 409, enforced by the UNIQUE constraint.
+3. `GET /products/{sku}` uses cache-aside and sets `X-Cache: HIT|MISS`. An unknown SKU returns 404.
+4. `POST /orders` merges duplicate SKUs and performs everything in **one transaction**:
+   - an unknown customer returns 404, and unknown SKUs return 422;
+   - insufficient stock returns 409 and **nothing changes**;
+   - stock is decremented atomically, and the total is computed from current prices;
+   - product cache keys are invalidated after commit.
+5. `GET /customers/{id}/orders` returns orders newest first, using exactly 3 SQL queries regardless of the number of orders.
+6. A Redis outage never fails a request.
+7. Alembic migration `0001` creates the schema. Upgrade and downgrade both work.
+8. A concurrency test proves only one of eight concurrent buyers gets the last unit (PostgreSQL).
+
+### Technical Requirements
+
+- Python 3.12+, FastAPI, SQLAlchemy 2.x, Alembic, psycopg 3, redis-py and pydantic-settings.
+- SQLite in-memory for fast tests. PostgreSQL 14+ (docker compose provides 18) for the realistic tests.
+- pytest; a `TEST_DATABASE_URL` switch for PostgreSQL.
+
+### Project Structure
+
+```text
+solution/
+├── alembic/
+│   ├── versions/
+│   │   └── 0001_initial_schema.py
+│   ├── env.py
+│   └── script.py.mako
+├── app/
+│   ├── services/
+│   │   ├── __init__.py
+│   │   ├── catalog.py
+│   │   └── orders.py
+│   ├── __init__.py
+│   ├── cache.py
+│   ├── config.py
+│   ├── db.py
+│   ├── errors.py
+│   ├── main.py
+│   ├── models.py
+│   ├── repositories.py
+│   ├── schemas.py
+│   └── seed.py
+├── scripts/
+│   ├── __init__.py
+│   └── explain_demo.py
+├── tests/
+│   ├── __init__.py
+│   ├── conftest.py
+│   ├── test_api.py
+│   ├── test_cache.py
+│   ├── test_concurrency.py
+│   ├── test_constraints.py
+│   └── test_repositories.py
+├── .env.example
+├── README.md
+├── alembic.ini
+├── docker-compose.yml
+├── pyproject.toml
+├── requirements-dev.txt
+└── requirements.txt
+```
+
+
+### Step-by-Step Implementation
+
+1. **Run the starter on SQLite.** `pip install -r requirements-dev.txt`, `python -m app.seed`, then `pytest -q`.
+   - *Why:* to see which behaviors are missing (failing tests).
+2. **Review `models.py`.** Identify every constraint and index and the business rule each encodes.
+   - *Test:* `pytest tests/test_constraints.py` passes already.
+3. **Generate and review the migration.**
+   - Start PostgreSQL with `docker compose up -d`.
+   - Run `alembic revision --autogenerate -m "initial schema"`.
+   - Read the file, run `alembic upgrade head`, then `alembic downgrade base` and `upgrade` again.
+   - *Why:* migrations, not `create_all`, are how real environments get schemas.
+4. **Implement the customer insert with IntegrityError translation** (`main.py`).
+   - *Test:* `test_create_customer_and_duplicate_email`.
+5. **Implement `RedisProductCache` and `CatalogService.get_product`.**
+   - *Test:* `test_product_read_is_cached` and `test_redis_outage_degrades_to_cache_miss`.
+6. **Implement `OrderRepository.list_for_customer` with `selectinload`.**
+   - *Test:* `test_list_orders_avoids_n_plus_one` (asserts exactly 3 queries).
+7. **Implement `OrderService.place_order`** (Counter merge, `session.begin()`, sorted atomic UPDATEs, invalidation after commit).
+   - *Test:* the order tests in `test_api.py`, especially `test_insufficient_stock_rolls_back_everything`.
+8. **Implement the concurrency test** and run it against PostgreSQL with `TEST_DATABASE_URL=... pytest -q`.
+9. **Run `python -m scripts.explain_demo`** against PostgreSQL and explain the before and after plans in your own words.
+
+### Starter Code
+
+**File: `app/services/orders.py`**
+
+```python
+"""Order placement: one transaction, atomic stock decrement."""
+
+from __future__ import annotations
+
+from collections import Counter  # noqa: F401
+from decimal import Decimal  # noqa: F401
+
+from sqlalchemy import update  # noqa: F401
+from sqlalchemy.orm import Session
+
+from app.cache import ProductCache
+from app.errors import (
+    NotFoundError,
+)
+from app.models import Customer, Order, OrderItem, Product  # noqa: F401
+from app.repositories import (  # noqa: F401
+    OrderRepository,
+    ProductRepository,
+)
+from app.schemas import OrderIn, OrderLineOut, OrderOut
+from app.services.catalog import cache_key  # noqa: F401
+
+
+def to_out(order: Order) -> OrderOut:
+    return OrderOut(
+        id=order.id,
+        customer_id=order.customer_id,
+        status=order.status,
+        total=order.total,
+        created_at=order.created_at,
+        lines=[
+            OrderLineOut(
+                sku=item.product.sku,
+                quantity=item.quantity,
+                unit_price=item.unit_price,
+            )
+            for item in order.items
+        ],
+    )
+
+
+class OrderService:
+    def __init__(self, session: Session, cache: ProductCache) -> None:
+        self._session = session
+        self._cache = cache
+
+    def place_order(self, data: OrderIn) -> OrderOut:
+        # TODO: implement order placement as ONE transaction:
+        # 1. merge duplicate SKUs (collections.Counter)
+        # 2. `with self._session.begin():` so any exception rolls back
+        # 3. NotFoundError if the customer does not exist
+        # 4. UnknownSkuError (422) listing SKUs that do not exist
+        # 5. for each SKU in sorted order run an atomic conditional
+        #    UPDATE products SET stock = stock - :qty
+        #    WHERE sku = :sku AND stock >= :qty RETURNING id, price
+        #    -> no row returned means InsufficientStockError
+        # 6. build Order + OrderItem rows, compute the total, add()
+        # 7. after commit, delete the product cache keys
+        raise NotImplementedError
+
+    def list_for_customer(self, customer_id: int) -> list[OrderOut]:
+        if self._session.get(Customer, customer_id) is None:
+            raise NotFoundError(f"Customer {customer_id} not found.")
+        orders = OrderRepository(self._session).list_for_customer(
+            customer_id
+        )
+        return [to_out(o) for o in orders]
+```
+
+
+**File: `app/repositories.py`**
+
+```python
+"""Repositories: the only code that builds SQL for these tables."""
+
+from __future__ import annotations
+
+from collections.abc import Iterable, Sequence
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session, selectinload  # noqa: F401
+
+from app.models import Customer, Order, OrderItem, Product  # noqa: F401
+
+
+class CustomerRepository:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def add(self, name: str, email: str) -> Customer:
+        customer = Customer(name=name, email=email)
+        self.session.add(customer)
+        self.session.flush()  # INSERT now so the id is available
+        return customer
+
+    def get(self, customer_id: int) -> Customer | None:
+        return self.session.get(Customer, customer_id)
+
+
+class ProductRepository:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def get_by_sku(self, sku: str) -> Product | None:
+        return self.session.scalar(
+            select(Product).where(Product.sku == sku)
+        )
+
+    def get_by_skus(self, skus: Iterable[str]) -> dict[str, Product]:
+        rows = self.session.scalars(
+            select(Product).where(Product.sku.in_(list(skus)))
+        )
+        return {p.sku: p for p in rows}
+
+
+class OrderRepository:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def list_for_customer(
+        self, customer_id: int, *, limit: int = 20
+    ) -> Sequence[Order]:
+        # TODO: select the customer's orders, newest first
+        # (created_at DESC, id DESC), limited to `limit`, and eager-load
+        # Order.items and OrderItem.product with selectinload so listing
+        # N orders costs 3 queries, not 1 + N + N (test_repositories).
+        raise NotImplementedError
+```
+
+
+**File: `app/services/catalog.py`**
+
+```python
+from __future__ import annotations
+
+from app.cache import ProductCache
+from app.errors import NotFoundError  # noqa: F401
+from app.repositories import ProductRepository
+from app.schemas import ProductOut
+
+
+def cache_key(sku: str) -> str:
+    return f"product:{sku}"
+
+
+class CatalogService:
+    def __init__(self, products: ProductRepository, cache: ProductCache):
+        self._products = products
+        self._cache = cache
+
+    def get_product(self, sku: str) -> tuple[ProductOut, bool]:
+        """Cache-aside: try cache, else DB then populate cache.
+
+        Returns (product, served_from_cache)."""
+        # TODO:
+        # 1. look up cache_key(sku) in self._cache -> HIT: return it, True
+        # 2. MISS: load from self._products; NotFoundError if missing
+        # 3. store out.model_dump(mode="json") in the cache, return False
+        raise NotImplementedError
+```
+
+
+The starter's `app/cache.py` (`RedisProductCache` methods), the `create_customer` route in `app/main.py`, and `tests/test_concurrency.py` contain further TODOs. `alembic/versions/` is empty, because you generate the first migration.
+
+### Practice Tasks
+
+1. **Normal behavior:**
+   - order creation decrements stock;
+   - totals are correct (2 × 89.00 + 29.50 = 207.50);
+   - listing is newest first;
+   - cache HIT on the second read.
+2. **Validation:** an empty `lines` list returns 422; `quantity < 1` returns 422; unknown fields return 422.
+3. **Errors:** an unknown customer returns 404; an unknown SKU returns 422; insufficient stock returns 409; a duplicate email returns 409.
+4. **Edge cases:**
+   - duplicate SKUs in one order are merged;
+   - a failure on the second SKU rolls back the first;
+   - the cache is invalidated after an order;
+   - a Redis outage is harmless.
+5. **Tests:** the concurrency test on PostgreSQL. Optionally, a test for `ON DELETE RESTRICT` (deleting a customer with orders fails).
+
+### Hints
+
+1. `Counter[str]()` with `quantities[line.sku] += line.quantity` merges duplicates.
+2. `with self._session.begin():` — raising any exception inside rolls back.
+3. `update(Product).where(Product.sku == sku, Product.stock >= qty).values(stock=Product.stock - qty).returning(Product.id, Product.price)`, then `.one_or_none()`.
+4. Build `OrderItem(product=products[sku], quantity=qty, unit_price=row.price)` and append it to `order.items`.
+5. Eager loading: `.options(selectinload(Order.items).selectinload(OrderItem.product))`.
+6. For the concurrency test, create **one session per thread**. Sessions are not thread-safe.
+
+### Expected Behavior
+
+```text
+POST /orders {"customer_id":1,"lines":[{"sku":"KB-01","quantity":2},
+                                       {"sku":"MS-01","quantity":1}]}
+→ 201 {"id":1,"customer_id":1,"status":"placed","total":"207.50",
+       "lines":[{"sku":"KB-01","quantity":2,"unit_price":"89.00"},
+                {"sku":"MS-01","quantity":1,"unit_price":"29.50"}],...}
+
+GET /products/KB-01 → 200  X-Cache: MISS   {"stock":23,...}
+GET /products/KB-01 → 200  X-Cache: HIT
+
+POST /orders ... {"sku":"MN-27","quantity":6} (stock 5)
+→ 409 {"title":"Insufficient stock","detail":"Not enough stock for MN-27."}
+  (and no stock changed for any other line)
+
+POST /orders ... {"sku":"NOPE","quantity":1}
+→ 422 {"title":"Unknown SKU","detail":"Unknown SKUs: NOPE"}
+```
+
+### Testing Requirements
+
+- **Unit and integration tests** on SQLite (fast feedback) and PostgreSQL (real behavior).
+- **Negative tests:** constraint violations, 404, 409, 422.
+- **Transaction test:** a partial failure rolls everything back.
+- **Performance regression test:** query count for the listing.
+- **Concurrency test** (PostgreSQL): eight threads, one winner.
+
+```bash
+pytest -q                                   # SQLite
+TEST_DATABASE_URL=postgresql+psycopg://orders:orders@localhost:5432/orders \
+  pytest -q                                 # PostgreSQL (+ concurrency)
+alembic upgrade head && alembic downgrade base && alembic upgrade head
+```
+
+### Final Runnable Solution
+
+**File: `README.md`**
+
+````markdown
+# Unit 3 Project — Orders Data Layer (SQLAlchemy 2.x + PostgreSQL)
+
+Schema with constraints and indexes, Alembic migrations, repositories,
+transactional order placement with an atomic stock decrement,
+N+1-free reads, and Redis cache-aside with graceful degradation.
+
+## Run (SQLite, zero setup)
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements-dev.txt
+python -m app.seed
+uvicorn app.main:create_app --factory --reload
+pytest -q
+```
+
+## Run against PostgreSQL + Redis
+
+```bash
+docker compose up -d
+cp .env.example .env
+alembic upgrade head          # create schema via migrations
+python -m app.seed
+uvicorn app.main:create_app --factory --reload
+TEST_DATABASE_URL=postgresql+psycopg://orders:orders@localhost:5432/orders \
+  pytest -q                   # includes the concurrency test
+python -m scripts.explain_demo   # index vs no index query plans
+```
+````
+
+**File: `.env.example`**
+
+```bash
+# SQLite works out of the box; PostgreSQL via docker compose:
+#   docker compose up -d
+APP_DATABASE_URL=postgresql+psycopg://orders:orders@localhost:5432/orders
+# Leave empty to use the in-process cache instead of Redis.
+APP_REDIS_URL=redis://localhost:6379/0
+APP_CACHE_TTL_SECONDS=60
+APP_SQL_ECHO=false
+```
+
+**File: `alembic.ini`**
+
+```ini
+[alembic]
+script_location = alembic
+prepend_sys_path = .
+# The URL comes from APP_DATABASE_URL (see alembic/env.py).
+
+[loggers]
+keys = root,sqlalchemy,alembic
+
+[handlers]
+keys = console
+
+[formatters]
+keys = generic
+
+[logger_root]
+level = WARNING
+handlers = console
+
+[logger_sqlalchemy]
+level = WARNING
+handlers =
+qualname = sqlalchemy.engine
+
+[logger_alembic]
+level = INFO
+handlers =
+qualname = alembic
+
+[handler_console]
+class = StreamHandler
+args = (sys.stderr,)
+formatter = generic
+
+[formatter_generic]
+format = %(levelname)-5.5s [%(name)s] %(message)s
+```
+
+**File: `alembic/env.py`**
+
+```python
+"""Alembic environment: uses the app's settings and metadata."""
+
+from logging.config import fileConfig
+
+from sqlalchemy import engine_from_config, pool
+
+from alembic import context
+from app import models  # noqa: F401  (registers tables on Base)
+from app.config import get_settings
+from app.db import Base
+
+config = context.config
+if config.config_file_name:
+    fileConfig(config.config_file_name)
+config.set_main_option("sqlalchemy.url", get_settings().database_url)
+target_metadata = Base.metadata
+
+
+def run_migrations_offline() -> None:
+    context.configure(
+        url=config.get_main_option("sqlalchemy.url"),
+        target_metadata=target_metadata,
+        literal_binds=True,
+    )
+    with context.begin_transaction():
+        context.run_migrations()
+
+
+def run_migrations_online() -> None:
+    connectable = engine_from_config(
+        config.get_section(config.config_ini_section, {}),
+        prefix="sqlalchemy.",
+        poolclass=pool.NullPool,
+    )
+    with connectable.connect() as connection:
+        context.configure(
+            connection=connection, target_metadata=target_metadata
+        )
+        with context.begin_transaction():
+            context.run_migrations()
+
+
+if context.is_offline_mode():
+    run_migrations_offline()
+else:
+    run_migrations_online()
+```
+
+**File: `alembic/script.py.mako`**
+
+```text
+"""${message}
+
+Revision ID: ${up_revision}
+Revises: ${down_revision | comma,n}
+Create Date: ${create_date}
+"""
+from alembic import op
+import sqlalchemy as sa
+${imports if imports else ""}
+
+revision = ${repr(up_revision)}
+down_revision = ${repr(down_revision)}
+branch_labels = ${repr(branch_labels)}
+depends_on = ${repr(depends_on)}
+
+
+def upgrade() -> None:
+    ${upgrades if upgrades else "pass"}
+
+
+def downgrade() -> None:
+    ${downgrades if downgrades else "pass"}
+```
+
+**File: `alembic/versions/0001_initial_schema.py`**
+
+```python
+"""initial schema
+
+Revision ID: 0001
+Revises:
+"""
+
+from alembic import op
+import sqlalchemy as sa
+
+
+revision = "0001"
+down_revision = None
+branch_labels = None
+depends_on = None
+
+
+def upgrade() -> None:
+    # Generated by `alembic revision --autogenerate`, then reviewed.
+    op.create_table(
+        "customers",
+        sa.Column("id", sa.Integer(), nullable=False),
+        sa.Column("name", sa.String(length=120), nullable=False),
+        sa.Column("email", sa.String(length=254), nullable=False),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+        sa.PrimaryKeyConstraint("id"),
+        sa.UniqueConstraint("email"),
+    )
+    op.create_table(
+        "products",
+        sa.Column("id", sa.Integer(), nullable=False),
+        sa.Column("sku", sa.String(length=40), nullable=False),
+        sa.Column("name", sa.String(length=200), nullable=False),
+        sa.Column(
+            "price", sa.Numeric(precision=10, scale=2), nullable=False
+        ),
+        sa.Column("stock", sa.Integer(), nullable=False),
+        sa.CheckConstraint("price > 0", name="ck_products_price_pos"),
+        sa.CheckConstraint("stock >= 0", name="ck_products_stock_nonneg"),
+        sa.PrimaryKeyConstraint("id"),
+        sa.UniqueConstraint("sku"),
+    )
+    op.create_table(
+        "orders",
+        sa.Column("id", sa.Integer(), nullable=False),
+        sa.Column("customer_id", sa.Integer(), nullable=False),
+        sa.Column("status", sa.String(length=20), nullable=False),
+        sa.Column(
+            "total", sa.Numeric(precision=12, scale=2), nullable=False
+        ),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+        sa.ForeignKeyConstraint(
+            ["customer_id"], ["customers.id"], ondelete="RESTRICT"
+        ),
+        sa.PrimaryKeyConstraint("id"),
+    )
+    op.create_index(
+        "ix_orders_customer_created",
+        "orders",
+        ["customer_id", "created_at"],
+        unique=False,
+    )
+    op.create_table(
+        "order_items",
+        sa.Column("id", sa.Integer(), nullable=False),
+        sa.Column("order_id", sa.Integer(), nullable=False),
+        sa.Column("product_id", sa.Integer(), nullable=False),
+        sa.Column("quantity", sa.Integer(), nullable=False),
+        sa.Column(
+            "unit_price", sa.Numeric(precision=10, scale=2), nullable=False
+        ),
+        sa.CheckConstraint("quantity > 0", name="ck_items_qty_pos"),
+        sa.ForeignKeyConstraint(
+            ["order_id"], ["orders.id"], ondelete="CASCADE"
+        ),
+        sa.ForeignKeyConstraint(
+            ["product_id"],
+            ["products.id"],
+        ),
+        sa.PrimaryKeyConstraint("id"),
+        sa.UniqueConstraint(
+            "order_id", "product_id", name="uq_item_product"
+        ),
+    )
+    op.create_index(
+        op.f("ix_order_items_order_id"),
+        "order_items",
+        ["order_id"],
+        unique=False,
+    )
+
+
+def downgrade() -> None:
+    # Generated by `alembic revision --autogenerate`, then reviewed.
+    op.drop_index(op.f("ix_order_items_order_id"), table_name="order_items")
+    op.drop_table("order_items")
+    op.drop_index("ix_orders_customer_created", table_name="orders")
+    op.drop_table("orders")
+    op.drop_table("products")
+    op.drop_table("customers")
+```
+
+**File: `app/__init__.py`**
+
+```python
+
+```
+
+**File: `app/cache.py`**
+
+```python
+"""Cache-aside for product reads: Redis in production, dict in tests."""
+
+from __future__ import annotations
+
+import json
+import logging
+import time
+from typing import Any, Protocol
+
+import redis
+
+log = logging.getLogger(__name__)
+
+
+class ProductCache(Protocol):
+    def get(self, key: str) -> dict[str, Any] | None: ...
+    def set(self, key: str, value: dict[str, Any]) -> None: ...
+    def delete(self, *keys: str) -> None: ...
+
+
+class InMemoryProductCache:
+    def __init__(self, ttl_seconds: int) -> None:
+        self._ttl = ttl_seconds
+        self._data: dict[str, tuple[float, dict[str, Any]]] = {}
+
+    def get(self, key: str) -> dict[str, Any] | None:
+        item = self._data.get(key)
+        if item is None or item[0] < time.monotonic():
+            self._data.pop(key, None)
+            return None
+        return item[1]
+
+    def set(self, key: str, value: dict[str, Any]) -> None:
+        self._data[key] = (time.monotonic() + self._ttl, value)
+
+    def delete(self, *keys: str) -> None:
+        for key in keys:
+            self._data.pop(key, None)
+
+
+class RedisProductCache:
+    """A cache outage must degrade performance, never correctness, so
+    every Redis error is logged and treated as a cache miss."""
+
+    def __init__(self, url: str, ttl_seconds: int) -> None:
+        self._client = redis.Redis.from_url(
+            url, socket_timeout=0.2, socket_connect_timeout=0.2
+        )
+        self._ttl = ttl_seconds
+
+    def get(self, key: str) -> dict[str, Any] | None:
+        try:
+            raw = self._client.get(key)
+        except redis.RedisError as exc:
+            log.warning("cache get failed: %s", exc)
+            return None
+        return json.loads(raw) if raw else None
+
+    def set(self, key: str, value: dict[str, Any]) -> None:
+        try:
+            self._client.set(key, json.dumps(value), ex=self._ttl)
+        except redis.RedisError as exc:
+            log.warning("cache set failed: %s", exc)
+
+    def delete(self, *keys: str) -> None:
+        if not keys:
+            return
+        try:
+            self._client.delete(*keys)
+        except redis.RedisError as exc:
+            log.warning("cache delete failed: %s", exc)
+```
+
+**File: `app/config.py`**
+
+```python
+from __future__ import annotations
+
+from functools import lru_cache
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="APP_", env_file=".env", extra="ignore"
+    )
+
+    database_url: str = "sqlite:///./orders.db"
+    redis_url: str = ""
+    cache_ttl_seconds: int = 60
+    sql_echo: bool = False
+    pool_size: int = 5
+    max_overflow: int = 10
+
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()
+```
+
+**File: `app/db.py`**
+
+```python
+"""Engine, connection pool and per-request sessions."""
+
+from __future__ import annotations
+
+from collections.abc import Iterator
+
+from sqlalchemy import Engine, create_engine, event
+from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
+from sqlalchemy.pool import StaticPool
+
+from app.config import Settings
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+def make_engine(settings: Settings) -> Engine:
+    url = settings.database_url
+    if url.startswith("sqlite"):
+        kwargs: dict[str, object] = {
+            "connect_args": {"check_same_thread": False}
+        }
+        if url in ("sqlite://", "sqlite:///:memory:"):
+            kwargs["poolclass"] = StaticPool  # one shared in-memory DB
+        engine = create_engine(url, echo=settings.sql_echo, **kwargs)
+
+        @event.listens_for(engine, "connect")
+        def _fk_on(dbapi_conn, _record):  # type: ignore[no-untyped-def]
+            # SQLite ignores foreign keys unless asked to enforce them.
+            dbapi_conn.execute("PRAGMA foreign_keys=ON")
+
+        return engine
+    # PostgreSQL: a bounded pool. pool_pre_ping discards dead
+    # connections (e.g. after a DB failover) before handing them out.
+    return create_engine(
+        url,
+        echo=settings.sql_echo,
+        pool_size=settings.pool_size,
+        max_overflow=settings.max_overflow,
+        pool_pre_ping=True,
+        pool_timeout=10,
+    )
+
+
+def make_session_factory(engine: Engine) -> sessionmaker[Session]:
+    # expire_on_commit=False: objects stay readable after commit, which
+    # is convenient when converting them to response models.
+    return sessionmaker(engine, expire_on_commit=False)
+
+
+def session_scope(factory: sessionmaker[Session]) -> Iterator[Session]:
+    """One session per request; always closed (connection returned)."""
+    session = factory()
+    try:
+        yield session
+    finally:
+        session.close()
+```
+
+**File: `app/errors.py`**
+
+```python
+from __future__ import annotations
+
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+
+
+class DomainError(Exception):
+    status_code = 400
+    title = "Bad request"
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(detail)
+        self.detail = detail
+
+
+class NotFoundError(DomainError):
+    status_code = 404
+    title = "Not found"
+
+
+class ConflictError(DomainError):
+    status_code = 409
+    title = "Conflict"
+
+
+class InsufficientStockError(ConflictError):
+    title = "Insufficient stock"
+
+
+class UnknownSkuError(DomainError):
+    status_code = 422
+    title = "Unknown SKU"
+
+
+def register_error_handlers(app: FastAPI) -> None:
+    @app.exception_handler(DomainError)
+    async def handle(_: Request, exc: DomainError) -> JSONResponse:
+        return JSONResponse(
+            {
+                "title": exc.title,
+                "status": exc.status_code,
+                "detail": exc.detail,
+            },
+            status_code=exc.status_code,
+            media_type="application/problem+json",
+        )
+```
+
+**File: `app/main.py`**
+
+```python
+"""FastAPI app wiring the data layer. Run:
+uvicorn app.main:create_app --factory --reload"""
+
+from __future__ import annotations
+
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager
+from typing import Annotated
+
+from fastapi import Depends, FastAPI, Request, Response, status
+from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+
+from app.cache import InMemoryProductCache, ProductCache, RedisProductCache
+from app.config import Settings, get_settings
+from app.db import Base, make_engine, make_session_factory, session_scope
+from app.errors import ConflictError, register_error_handlers
+from app.repositories import CustomerRepository, ProductRepository
+from app.schemas import (
+    CustomerIn,
+    CustomerOut,
+    OrderIn,
+    OrderOut,
+    ProductOut,
+)
+from app.services.catalog import CatalogService
+from app.services.orders import OrderService
+
+
+def get_session(request: Request) -> Iterator[Session]:
+    yield from session_scope(request.app.state.session_factory)
+
+
+def get_cache(request: Request) -> ProductCache:
+    cache: ProductCache = request.app.state.cache
+    return cache
+
+
+SessionDep = Annotated[Session, Depends(get_session)]
+CacheDep = Annotated[ProductCache, Depends(get_cache)]
+
+
+def create_app(
+    settings: Settings | None = None, *, create_schema: bool = True
+) -> FastAPI:
+    settings = settings or get_settings()
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        engine = make_engine(settings)
+        if create_schema:
+            # Dev convenience only. Real environments run
+            # `alembic upgrade head` as a deploy step.
+            Base.metadata.create_all(engine)
+        app.state.engine = engine
+        app.state.session_factory = make_session_factory(engine)
+        app.state.cache = (
+            RedisProductCache(
+                settings.redis_url, settings.cache_ttl_seconds
+            )
+            if settings.redis_url
+            else InMemoryProductCache(settings.cache_ttl_seconds)
+        )
+        yield
+        engine.dispose()  # close pooled connections
+
+    app = FastAPI(title="Orders Data API", lifespan=lifespan)
+    register_error_handlers(app)
+
+    # Sync `def` endpoints: SQLAlchemy sync sessions block, so FastAPI
+    # runs these in its threadpool instead of on the event loop.
+    @app.get("/health")
+    def health(session: SessionDep) -> dict[str, str]:
+        session.execute(text("SELECT 1"))
+        return {"status": "ok", "database": "up"}
+
+    @app.post("/customers", status_code=status.HTTP_201_CREATED)
+    def create_customer(
+        body: CustomerIn, session: SessionDep
+    ) -> CustomerOut:
+        try:
+            with session.begin():
+                customer = CustomerRepository(session).add(
+                    body.name, body.email.lower()
+                )
+        except IntegrityError as exc:
+            # The UNIQUE constraint is the source of truth; checking
+            # first and inserting second would race.
+            raise ConflictError("Email already registered.") from exc
+        return CustomerOut.model_validate(customer)
+
+    @app.get("/products/{sku}")
+    def get_product(
+        sku: str, session: SessionDep, cache: CacheDep, response: Response
+    ) -> ProductOut:
+        product, hit = CatalogService(
+            ProductRepository(session), cache
+        ).get_product(sku)
+        response.headers["X-Cache"] = "HIT" if hit else "MISS"
+        return product
+
+    @app.post("/orders", status_code=status.HTTP_201_CREATED)
+    def place_order(
+        body: OrderIn, session: SessionDep, cache: CacheDep
+    ) -> OrderOut:
+        return OrderService(session, cache).place_order(body)
+
+    @app.get("/customers/{customer_id}/orders")
+    def list_orders(
+        customer_id: int, session: SessionDep, cache: CacheDep
+    ) -> list[OrderOut]:
+        return OrderService(session, cache).list_for_customer(customer_id)
+
+    return app
+```
+
+**File: `app/models.py`**
+
+```python
+"""ORM models (SQLAlchemy 2.0 typed declarative style)."""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from decimal import Decimal
+
+from sqlalchemy import (
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Index,
+    Numeric,
+    String,
+    UniqueConstraint,
+)
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from app.db import Base
+
+
+def utcnow() -> datetime:
+    return datetime.now(UTC)
+
+
+class Customer(Base):
+    __tablename__ = "customers"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(120))
+    email: Mapped[str] = mapped_column(String(254), unique=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow
+    )
+
+    orders: Mapped[list[Order]] = relationship(back_populates="customer")
+
+
+class Product(Base):
+    __tablename__ = "products"
+    __table_args__ = (
+        CheckConstraint("stock >= 0", name="ck_products_stock_nonneg"),
+        CheckConstraint("price > 0", name="ck_products_price_pos"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    sku: Mapped[str] = mapped_column(String(40), unique=True)
+    name: Mapped[str] = mapped_column(String(200))
+    price: Mapped[Decimal] = mapped_column(Numeric(10, 2))
+    stock: Mapped[int] = mapped_column(default=0)
+
+
+class Order(Base):
+    __tablename__ = "orders"
+    __table_args__ = (
+        # Supports "orders for customer X, newest first" without a sort.
+        Index("ix_orders_customer_created", "customer_id", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    customer_id: Mapped[int] = mapped_column(
+        ForeignKey("customers.id", ondelete="RESTRICT")
+    )
+    status: Mapped[str] = mapped_column(String(20), default="placed")
+    total: Mapped[Decimal] = mapped_column(Numeric(12, 2))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow
+    )
+
+    customer: Mapped[Customer] = relationship(back_populates="orders")
+    items: Mapped[list[OrderItem]] = relationship(
+        back_populates="order", cascade="all, delete-orphan"
+    )
+
+
+class OrderItem(Base):
+    __tablename__ = "order_items"
+    __table_args__ = (
+        CheckConstraint("quantity > 0", name="ck_items_qty_pos"),
+        UniqueConstraint("order_id", "product_id", name="uq_item_product"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    order_id: Mapped[int] = mapped_column(
+        ForeignKey("orders.id", ondelete="CASCADE"), index=True
+    )
+    product_id: Mapped[int] = mapped_column(ForeignKey("products.id"))
+    quantity: Mapped[int]
+    unit_price: Mapped[Decimal] = mapped_column(Numeric(10, 2))
+
+    order: Mapped[Order] = relationship(back_populates="items")
+    product: Mapped[Product] = relationship()
+```
+
+**File: `app/repositories.py`**
+
+```python
+"""Repositories: the only code that builds SQL for these tables."""
+
+from __future__ import annotations
+
+from collections.abc import Iterable, Sequence
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session, selectinload
+
+from app.models import Customer, Order, OrderItem, Product
+
+
+class CustomerRepository:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def add(self, name: str, email: str) -> Customer:
+        customer = Customer(name=name, email=email)
+        self.session.add(customer)
+        self.session.flush()  # INSERT now so the id is available
+        return customer
+
+    def get(self, customer_id: int) -> Customer | None:
+        return self.session.get(Customer, customer_id)
+
+
+class ProductRepository:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def get_by_sku(self, sku: str) -> Product | None:
+        return self.session.scalar(
+            select(Product).where(Product.sku == sku)
+        )
+
+    def get_by_skus(self, skus: Iterable[str]) -> dict[str, Product]:
+        rows = self.session.scalars(
+            select(Product).where(Product.sku.in_(list(skus)))
+        )
+        return {p.sku: p for p in rows}
+
+
+class OrderRepository:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def list_for_customer(
+        self, customer_id: int, *, limit: int = 20
+    ) -> Sequence[Order]:
+        stmt = (
+            select(Order)
+            .where(Order.customer_id == customer_id)
+            .order_by(Order.created_at.desc(), Order.id.desc())
+            .limit(limit)
+            # Eager-load items and their products in 2 extra queries
+            # total, instead of 1 query per order (the N+1 problem).
+            .options(
+                selectinload(Order.items).selectinload(OrderItem.product)
+            )
+        )
+        return self.session.scalars(stmt).all()
+```
+
+**File: `app/schemas.py`**
+
+```python
+"""API schemas (separate from ORM models)."""
+
+from __future__ import annotations
+
+from datetime import datetime
+from decimal import Decimal
+from typing import Annotated
+
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
+
+
+class CustomerIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: Annotated[str, Field(min_length=1, max_length=120)]
+    email: EmailStr
+
+
+class CustomerOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    name: str
+    email: str
+
+
+class ProductOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    sku: str
+    name: str
+    price: Decimal
+    stock: int
+
+
+class OrderLineIn(BaseModel):
+    sku: Annotated[str, Field(min_length=1, max_length=40)]
+    quantity: Annotated[int, Field(ge=1, le=1000)]
+
+
+class OrderIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    customer_id: int
+    lines: Annotated[list[OrderLineIn], Field(min_length=1, max_length=50)]
+
+
+class OrderLineOut(BaseModel):
+    sku: str
+    quantity: int
+    unit_price: Decimal
+
+
+class OrderOut(BaseModel):
+    id: int
+    customer_id: int
+    status: str
+    total: Decimal
+    created_at: datetime
+    lines: list[OrderLineOut]
+```
+
+**File: `app/seed.py`**
+
+```python
+"""Seed demo data: python -m app.seed"""
+
+from __future__ import annotations
+
+from decimal import Decimal
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from app.config import get_settings
+from app.db import Base, make_engine
+from app.models import Customer, Product
+
+PRODUCTS = [
+    ("KB-01", "Mechanical keyboard", Decimal("89.00"), 25),
+    ("MS-01", "Wireless mouse", Decimal("29.50"), 100),
+    ("MN-27", "27-inch monitor", Decimal("249.99"), 5),
+]
+
+
+def seed(session: Session) -> None:
+    if session.scalar(select(Product).limit(1)) is not None:
+        return
+    session.add_all(
+        Product(sku=s, name=n, price=p, stock=q) for s, n, p, q in PRODUCTS
+    )
+    session.add(Customer(name="Jorge", email="jorge@example.com"))
+    session.commit()
+
+
+if __name__ == "__main__":
+    engine = make_engine(get_settings())
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        seed(session)
+    print("seeded")
+```
+
+**File: `app/services/__init__.py`**
+
+```python
+
+```
+
+**File: `app/services/catalog.py`**
+
+```python
+from __future__ import annotations
+
+from app.cache import ProductCache
+from app.errors import NotFoundError
+from app.repositories import ProductRepository
+from app.schemas import ProductOut
+
+
+def cache_key(sku: str) -> str:
+    return f"product:{sku}"
+
+
+class CatalogService:
+    def __init__(self, products: ProductRepository, cache: ProductCache):
+        self._products = products
+        self._cache = cache
+
+    def get_product(self, sku: str) -> tuple[ProductOut, bool]:
+        """Cache-aside: try cache, else DB then populate cache.
+
+        Returns (product, served_from_cache)."""
+        cached = self._cache.get(cache_key(sku))
+        if cached is not None:
+            return ProductOut.model_validate(cached), True
+        product = self._products.get_by_sku(sku)
+        if product is None:
+            raise NotFoundError(f"Product {sku} not found.")
+        out = ProductOut.model_validate(product)
+        self._cache.set(cache_key(sku), out.model_dump(mode="json"))
+        return out, False
+```
+
+**File: `app/services/orders.py`**
+
+```python
+"""Order placement: one transaction, atomic stock decrement."""
+
+from __future__ import annotations
+
+from collections import Counter
+from decimal import Decimal
+
+from sqlalchemy import update
+from sqlalchemy.orm import Session
+
+from app.cache import ProductCache
+from app.errors import (
+    InsufficientStockError,
+    NotFoundError,
+    UnknownSkuError,
+)
+from app.models import Customer, Order, OrderItem, Product
+from app.repositories import OrderRepository, ProductRepository
+from app.schemas import OrderIn, OrderLineOut, OrderOut
+from app.services.catalog import cache_key
+
+
+def to_out(order: Order) -> OrderOut:
+    return OrderOut(
+        id=order.id,
+        customer_id=order.customer_id,
+        status=order.status,
+        total=order.total,
+        created_at=order.created_at,
+        lines=[
+            OrderLineOut(
+                sku=item.product.sku,
+                quantity=item.quantity,
+                unit_price=item.unit_price,
+            )
+            for item in order.items
+        ],
+    )
+
+
+class OrderService:
+    def __init__(self, session: Session, cache: ProductCache) -> None:
+        self._session = session
+        self._cache = cache
+
+    def place_order(self, data: OrderIn) -> OrderOut:
+        quantities = Counter[str]()
+        for line in data.lines:
+            quantities[line.sku] += line.quantity  # merge duplicate SKUs
+
+        # session.begin(): COMMIT if the block finishes, ROLLBACK if it
+        # raises. Either every row changes or none does (atomicity).
+        with self._session.begin():
+            if self._session.get(Customer, data.customer_id) is None:
+                raise NotFoundError(
+                    f"Customer {data.customer_id} not found."
+                )
+            products = ProductRepository(self._session).get_by_skus(
+                quantities
+            )
+            missing = sorted(set(quantities) - set(products))
+            if missing:
+                raise UnknownSkuError(f"Unknown SKUs: {', '.join(missing)}")
+
+            order = Order(customer_id=data.customer_id, total=Decimal("0"))
+            total = Decimal("0")
+            # Sorted order = every transaction locks rows in the same
+            # order, which prevents deadlocks between concurrent orders.
+            for sku in sorted(quantities):
+                qty = quantities[sku]
+                # Conditional UPDATE is atomic: check and decrement happen
+                # in one statement, so two concurrent orders cannot both
+                # take the last unit (no read-then-write race).
+                row = self._session.execute(
+                    update(Product)
+                    .where(Product.sku == sku, Product.stock >= qty)
+                    .values(stock=Product.stock - qty)
+                    .returning(Product.id, Product.price)
+                ).one_or_none()
+                if row is None:
+                    raise InsufficientStockError(
+                        f"Not enough stock for {sku}."
+                    )
+                order.items.append(
+                    OrderItem(
+                        product=products[sku],
+                        quantity=qty,
+                        unit_price=row.price,
+                    )
+                )
+                total += row.price * qty
+            order.total = total
+            self._session.add(order)
+        # Invalidate AFTER commit so readers never re-cache stale stock.
+        self._cache.delete(*(cache_key(s) for s in quantities))
+        return to_out(order)
+
+    def list_for_customer(self, customer_id: int) -> list[OrderOut]:
+        if self._session.get(Customer, customer_id) is None:
+            raise NotFoundError(f"Customer {customer_id} not found.")
+        orders = OrderRepository(self._session).list_for_customer(
+            customer_id
+        )
+        return [to_out(o) for o in orders]
+```
+
+**File: `docker-compose.yml`**
+
+```yaml
+services:
+  db:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: orders
+      POSTGRES_PASSWORD: orders
+      POSTGRES_DB: orders
+    ports: ["5432:5432"]
+    volumes: ["pgdata:/var/lib/postgresql"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orders"]
+      interval: 5s
+      retries: 10
+  redis:
+    image: redis:8
+    ports: ["6379:6379"]
+volumes:
+  pgdata:
+```
+
+**File: `pyproject.toml`**
+
+```toml
+[project]
+name = "orders-data"
+version = "1.0.0"
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 76
+target-version = "py312"
+extend-exclude = ["alembic/versions"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = ["fastapi.Depends", "fastapi.Query"]
+
+[tool.mypy]
+strict = true
+plugins = ["pydantic.mypy"]
+packages = ["app"]
+```
+
+**File: `requirements-dev.txt`**
+
+```text
+-r requirements.txt
+pytest>=8
+httpx>=0.27
+mypy>=1.10
+ruff>=0.6
+```
+
+**File: `requirements.txt`**
+
+```text
+fastapi>=0.135
+uvicorn[standard]>=0.30
+pydantic>=2.9
+pydantic-settings>=2.6
+sqlalchemy>=2.0
+alembic>=1.13
+psycopg[binary]>=3.2
+redis>=5.0
+```
+
+**File: `scripts/__init__.py`**
+
+```python
+
+```
+
+**File: `scripts/explain_demo.py`**
+
+```python
+"""Show how an index changes a query plan (PostgreSQL only).
+
+APP_DATABASE_URL=postgresql+psycopg://... python -m scripts.explain_demo
+"""
+
+from __future__ import annotations
+
+from sqlalchemy import text
+
+from app.config import get_settings
+from app.db import make_engine
+
+QUERY = """
+EXPLAIN (ANALYZE, BUFFERS, COSTS OFF)
+SELECT id, total, created_at FROM demo_orders
+WHERE customer_id = 4242
+ORDER BY created_at DESC
+LIMIT 20
+"""
+
+
+def main() -> None:
+    engine = make_engine(get_settings())
+    if engine.dialect.name != "postgresql":
+        raise SystemExit("This demo needs PostgreSQL (APP_DATABASE_URL).")
+    with engine.begin() as conn:
+        conn.execute(text("DROP TABLE IF EXISTS demo_orders"))
+        conn.execute(
+            text(
+                "CREATE TABLE demo_orders (id bigserial PRIMARY KEY,"
+                " customer_id int NOT NULL, total numeric(12,2) NOT NULL,"
+                " created_at timestamptz NOT NULL)"
+            )
+        )
+        # 500k rows, 10k customers: realistic enough to see the effect.
+        conn.execute(
+            text(
+                "INSERT INTO demo_orders (customer_id, total, created_at)"
+                " SELECT (random()*10000)::int,"
+                " (random()*500)::numeric(12,2),"
+                " now() - (random() * interval '365 days')"
+                " FROM generate_series(1, 500000)"
+            )
+        )
+        conn.execute(text("ANALYZE demo_orders"))
+        print("--- BEFORE index ---")
+        for row in conn.execute(text(QUERY)):
+            print(row[0])
+        conn.execute(
+            text(
+                "CREATE INDEX ix_demo_customer_created"
+                " ON demo_orders (customer_id, created_at DESC)"
+            )
+        )
+        conn.execute(text("ANALYZE demo_orders"))
+        print("--- AFTER index ---")
+        for row in conn.execute(text(QUERY)):
+            print(row[0])
+        conn.execute(text("DROP TABLE demo_orders"))
+
+
+if __name__ == "__main__":
+    main()
+```
+
+**File: `tests/__init__.py`**
+
+```python
+
+```
+
+**File: `tests/conftest.py`**
+
+```python
+"""Tests run on in-memory SQLite by default. Set TEST_DATABASE_URL to
+a PostgreSQL URL to run the same suite (plus concurrency tests) there."""
+
+from __future__ import annotations
+
+import os
+from collections.abc import Iterator
+
+import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy import Engine
+from sqlalchemy.orm import Session
+
+from app.config import Settings
+from app.db import Base, make_engine
+from app.main import create_app
+from app.seed import seed
+
+TEST_DB_URL = os.environ.get("TEST_DATABASE_URL", "sqlite://")
+IS_POSTGRES = TEST_DB_URL.startswith("postgresql")
+
+
+@pytest.fixture
+def settings() -> Settings:
+    return Settings(database_url=TEST_DB_URL, redis_url="")
+
+
+@pytest.fixture
+def engine(settings: Settings) -> Iterator[Engine]:
+    engine = make_engine(settings)
+    Base.metadata.drop_all(engine)
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        seed(session)
+    yield engine
+    Base.metadata.drop_all(engine)
+    engine.dispose()
+
+
+@pytest.fixture
+def client(settings: Settings, engine: Engine) -> Iterator[TestClient]:
+    app = create_app(settings, create_schema=False)
+    with TestClient(app) as test_client:
+        # Share the test engine so the app sees the seeded data
+        # (essential for in-memory SQLite).
+        app.state.engine.dispose()
+        from app.db import make_session_factory
+
+        app.state.engine = engine
+        app.state.session_factory = make_session_factory(engine)
+        yield test_client
+```
+
+**File: `tests/test_api.py`**
+
+```python
+from fastapi.testclient import TestClient
+
+
+def order(
+    client: TestClient, *lines: tuple[str, int], customer_id: int = 1
+):
+    return client.post(
+        "/orders",
+        json={
+            "customer_id": customer_id,
+            "lines": [{"sku": s, "quantity": q} for s, q in lines],
+        },
+    )
+
+
+def test_health_checks_database(client: TestClient) -> None:
+    assert client.get("/health").json()["database"] == "up"
+
+
+def test_create_customer_and_duplicate_email(client: TestClient) -> None:
+    body = {"name": "Ada", "email": "Ada@Example.com"}
+    first = client.post("/customers", json=body)
+    assert first.status_code == 201
+    assert first.json()["email"] == "ada@example.com"
+    second = client.post("/customers", json=body)
+    assert second.status_code == 409
+
+
+def test_product_read_is_cached(client: TestClient) -> None:
+    first = client.get("/products/KB-01")
+    second = client.get("/products/KB-01")
+    assert first.headers["x-cache"] == "MISS"
+    assert second.headers["x-cache"] == "HIT"
+    assert second.json()["stock"] == 25
+
+
+def test_place_order_decrements_stock_and_totals(
+    client: TestClient,
+) -> None:
+    response = order(client, ("KB-01", 2), ("MS-01", 1))
+    assert response.status_code == 201
+    body = response.json()
+    assert body["total"] == "207.50"  # 2*89.00 + 29.50
+    assert client.get("/products/KB-01").json()["stock"] == 23
+
+
+def test_duplicate_skus_in_one_order_are_merged(client: TestClient) -> None:
+    response = order(client, ("MS-01", 1), ("MS-01", 2))
+    assert response.status_code == 201
+    assert response.json()["lines"] == [
+        {"sku": "MS-01", "quantity": 3, "unit_price": "29.50"}
+    ]
+
+
+def test_insufficient_stock_rolls_back_everything(
+    client: TestClient,
+) -> None:
+    # KB-01 succeeds first (sorted order), then MN-27 fails: the KB-01
+    # decrement must be rolled back too.
+    response = order(client, ("MN-27", 6), ("KB-01", 1))
+    assert response.status_code == 409
+    assert response.json()["title"] == "Insufficient stock"
+    assert client.get("/products/KB-01").json()["stock"] == 25
+    assert client.get("/customers/1/orders").json() == []
+
+
+def test_cache_is_invalidated_after_order(client: TestClient) -> None:
+    assert client.get("/products/MN-27").json()["stock"] == 5
+    assert order(client, ("MN-27", 2)).status_code == 201
+    after = client.get("/products/MN-27")
+    assert after.headers["x-cache"] == "MISS"
+    assert after.json()["stock"] == 3
+
+
+def test_unknown_sku_and_customer(client: TestClient) -> None:
+    assert order(client, ("NOPE", 1)).status_code == 422
+    assert order(client, ("KB-01", 1), customer_id=999).status_code == 404
+
+
+def test_order_validation(client: TestClient) -> None:
+    assert order(client).status_code == 422  # no lines
+    assert order(client, ("KB-01", 0)).status_code == 422
+
+
+def test_list_orders_newest_first(client: TestClient) -> None:
+    order(client, ("KB-01", 1))
+    order(client, ("MS-01", 1))
+    orders = client.get("/customers/1/orders").json()
+    assert [o["lines"][0]["sku"] for o in orders] == ["MS-01", "KB-01"]
+    assert client.get("/customers/999/orders").status_code == 404
+```
+
+**File: `tests/test_cache.py`**
+
+```python
+import time
+
+from app.cache import InMemoryProductCache, RedisProductCache
+
+
+def test_in_memory_cache_expires() -> None:
+    cache = InMemoryProductCache(ttl_seconds=0)
+    cache.set("k", {"a": 1})
+    time.sleep(0.01)
+    assert cache.get("k") is None
+
+
+def test_redis_outage_degrades_to_cache_miss() -> None:
+    # Nothing listens on port 1: every call fails fast and is swallowed.
+    cache = RedisProductCache("redis://127.0.0.1:1/0", ttl_seconds=60)
+    cache.set("k", {"a": 1})
+    assert cache.get("k") is None
+    cache.delete("k")
+```
+
+**File: `tests/test_concurrency.py`**
+
+```python
+"""Two customers race for the last unit. Exactly one may win.
+
+Runs only against PostgreSQL (real row locks); SQLite serialises
+writes for the whole database, which hides the race."""
+
+from concurrent.futures import ThreadPoolExecutor
+
+import pytest
+from sqlalchemy import Engine
+from sqlalchemy.orm import Session
+
+from app.cache import InMemoryProductCache
+from app.db import make_session_factory
+from app.errors import InsufficientStockError
+from app.models import Product
+from app.schemas import OrderIn
+from app.services.orders import OrderService
+from tests.conftest import IS_POSTGRES
+
+pytestmark = pytest.mark.skipif(
+    not IS_POSTGRES, reason="needs TEST_DATABASE_URL=postgresql+psycopg://"
+)
+
+
+def test_last_unit_is_sold_once(engine: Engine) -> None:
+    factory = make_session_factory(engine)
+    with Session(engine) as session:
+        session.query(Product).filter_by(sku="MN-27").update({"stock": 1})
+        session.commit()
+
+    def attempt(_: int) -> str:
+        with factory() as session:
+            service = OrderService(session, InMemoryProductCache(60))
+            try:
+                service.place_order(
+                    OrderIn.model_validate(
+                        {
+                            "customer_id": 1,
+                            "lines": [{"sku": "MN-27", "quantity": 1}],
+                        }
+                    )
+                )
+                return "ok"
+            except InsufficientStockError:
+                return "sold out"
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(attempt, range(8)))
+
+    assert results.count("ok") == 1
+    assert results.count("sold out") == 7
+    with Session(engine) as session:
+        stock = session.query(Product).filter_by(sku="MN-27").one().stock
+        assert stock == 0
+```
+
+**File: `tests/test_constraints.py`**
+
+```python
+from decimal import Decimal
+
+import pytest
+from sqlalchemy import Engine
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+
+from app.models import Order, Product
+
+
+def test_stock_cannot_go_negative(engine: Engine) -> None:
+    with Session(engine) as session:
+        session.add(
+            Product(sku="X", name="x", price=Decimal("1"), stock=-1)
+        )
+        with pytest.raises(IntegrityError):
+            session.commit()
+
+
+def test_order_requires_existing_customer(engine: Engine) -> None:
+    with Session(engine) as session:
+        session.add(Order(customer_id=12345, total=Decimal("1")))
+        with pytest.raises(IntegrityError):
+            session.commit()
+```
+
+**File: `tests/test_repositories.py`**
+
+```python
+from decimal import Decimal
+
+from sqlalchemy import Engine, event
+from sqlalchemy.orm import Session
+
+from app.models import Order, OrderItem, Product
+from app.repositories import OrderRepository
+
+
+def test_list_orders_avoids_n_plus_one(engine: Engine) -> None:
+    with Session(engine) as session:
+        product = session.query(Product).filter_by(sku="KB-01").one()
+        for _ in range(5):
+            session.add(
+                Order(
+                    customer_id=1,
+                    total=Decimal("89.00"),
+                    items=[
+                        OrderItem(
+                            product=product,
+                            quantity=1,
+                            unit_price=Decimal("89.00"),
+                        )
+                    ],
+                )
+            )
+        session.commit()
+
+    statements: list[str] = []
+
+    def count(*args: object) -> None:
+        statements.append(str(args[2]))  # (conn, cursor, statement, ...)
+
+    event.listen(engine, "before_cursor_execute", count)
+    try:
+        with Session(engine) as session:
+            orders = OrderRepository(session).list_for_customer(1)
+            skus = [i.product.sku for o in orders for i in o.items]
+    finally:
+        event.remove(engine, "before_cursor_execute", count)
+
+    assert len(skus) == 5
+    # orders + items + products = 3 queries, regardless of order count.
+    assert len(statements) == 3
+```
+
+
+### How to Run
+
+```bash
+cd projects/unit03-data/solution
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements-dev.txt
+python -m app.seed && uvicorn app.main:create_app --factory --reload
+pytest -q
+# PostgreSQL + Redis:
+docker compose up -d && cp .env.example .env
+alembic upgrade head && python -m app.seed
+uvicorn app.main:create_app --factory --reload
+```
+
+### Verify the Solution
+
+1. `pytest -q` on SQLite gives **15 passed, 1 skipped** (the concurrency test).
+2. Against PostgreSQL: **16 passed**, including `test_last_unit_is_sold_once`.
+3. `curl -i localhost:8000/products/KB-01` twice gives `X-Cache: MISS`, then `HIT`.
+4. Place the order shown above and check that `stock` dropped by 2.
+5. Order 6 × MN-27: **409**. `GET /customers/1/orders` shows no new order (rollback).
+6. Stop Redis (`docker compose stop redis`). Product reads still work, and the logs show "cache get failed".
+7. `python -m scripts.explain_demo` shows a seq scan before and an index scan after.
+
+### Project Interview Debrief
+
+1. **Why an atomic `UPDATE ... WHERE stock >= q` instead of reading the stock first?**
+   Reading and then writing is a race under Read Committed: two requests can both read stock 1. One conditional UPDATE checks and writes atomically under a row lock. The concurrency test proves it.
+2. **What would break first at scale?**
+   Hot rows (a popular SKU) serialize writers, and the connection count grows with replicas. Mitigations: keep transactions short, add PgBouncer or RDS Proxy, possibly use a reservation pattern or queue for flash sales, read replicas for listings, and keyset pagination.
+3. **Why invalidate the cache instead of updating it?**
+   Deleting after commit is simpler and avoids writing a value computed from a transaction that might not commit. The next read repopulates from the source of truth.
+4. **What would you change for production?**
+   Run migrations as a deploy step, use DB credentials from a secret manager, add pool metrics and slow-query logging, add idempotency keys on `POST /orders` (Unit 8), monitor with `pg_stat_statements`, run backups and restore drills.
+5. **Why SQLite in tests if production is PostgreSQL?**
+   Fast feedback for logic. But concurrency, locking and some SQL behavior differ, so CI also runs the suite against a real PostgreSQL service (Unit 7) — never SQLite alone.
