@@ -1,0 +1,8 @@
+fastapi>=0.135
+uvicorn[standard]>=0.30
+pydantic>=2.9
+pydantic-settings>=2.6
+pyyaml>=6.0
+# Provider SDKs (only imported when APP_PROVIDER selects them)
+anthropic>=1.13
+openai>=3.31
