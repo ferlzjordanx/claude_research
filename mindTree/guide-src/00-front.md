@@ -38,9 +38,9 @@ mindTree/
     ├── unit03-data/          {starter, solution}
     ├── unit04-spa/           {starter, solution}
     ├── unit05-fullstack/     {starter, solution}
-    ├── unit06-cloud-native/  {starter, solution}
+    ├── unit06-cloud/         {starter, solution}
     ├── unit07-cicd/          {starter, solution}
-    ├── unit08-distributed/   {starter, solution}
+    ├── unit08-microservices/ {starter, solution}
     ├── unit09-llm/           {starter, solution}
     ├── unit10-rag-agents/    {starter, solution}
     ├── unit11-observability/ {starter, solution}

@@ -1,0 +1,16 @@
+# Non-secret settings only. Changing a ConfigMap does not restart
+# pods: roll them (kubectl rollout restart) or use a kustomize
+# configMapGenerator, whose name hash changes with the content.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: inventory-config
+  namespace: inventory
+  labels:
+    app.kubernetes.io/name: inventory-api
+data:
+  APP_ENVIRONMENT: prod
+  APP_LOG_LEVEL: INFO
+  APP_VERSION: "1.0.0"
+  # Schema changes run as a migration Job, not on every pod start.
+  APP_CREATE_SCHEMA: "false"

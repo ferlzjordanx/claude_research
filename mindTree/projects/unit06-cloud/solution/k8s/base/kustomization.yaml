@@ -1,0 +1,18 @@
+# kubectl apply -k k8s/base   (or an overlay: k8s/overlays/dev)
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: inventory
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: inventory
+    includeSelectors: false
+resources:
+  - namespace.yaml
+  - serviceaccount.yaml
+  - configmap.yaml
+  - secret.example.yaml
+  - deployment.yaml
+  - service.yaml
+  - ingress.yaml
+  - hpa.yaml
+  - pdb.yaml

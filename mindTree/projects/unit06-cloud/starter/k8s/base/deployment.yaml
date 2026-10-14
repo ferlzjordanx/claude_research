@@ -1,0 +1,83 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inventory-api
+  namespace: inventory
+  labels:
+    app.kubernetes.io/name: inventory-api
+spec:
+  replicas: 2            # the HPA takes over after the first apply
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: inventory-api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1        # one extra pod during a rollout
+      maxUnavailable: 0  # never drop below the desired count
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: inventory-api
+    spec:
+      serviceAccountName: inventory-api
+      # Must exceed preStop sleep (10s) + uvicorn graceful shutdown
+      # (20s), or the kubelet sends SIGKILL mid-request.
+      terminationGracePeriodSeconds: 40
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: inventory-api
+      containers:
+        - name: api
+          # Pin a version (or better, a digest @sha256:...). Never
+          # :latest: you cannot tell what is running or roll back.
+          image: >-
+            111122223333.dkr.ecr.us-east-1.amazonaws.com/inventory-api:1.0.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: inventory-config
+            - secretRef:
+                name: inventory-secrets
+          # TODO(6): resources. requests (cpu 100m, memory 128Mi)
+          # and limits (memory 256Mi; cpu optional). Without a
+          # memory limit one leaky pod can starve the whole node;
+          # without requests the HPA cannot compute utilization.
+          # TODO(5): probes, all httpGet on the named port "http".
+          #   startupProbe   /health/live  period 2s, failures 30
+          #   livenessProbe  /health/live  period 10s, failures 3
+          #   readinessProbe /health/ready period 5s, failures 2
+          lifecycle:
+            preStop:
+              # Keep serving while endpoints/ALB targets deregister,
+              # then Kubernetes sends SIGTERM. Native sleep action
+              # [Current, K8s 1.30+]; older clusters use
+              # exec: {command: ["sleep", "10"]}.
+              sleep:
+                seconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi

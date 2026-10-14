@@ -1,0 +1,17 @@
+# Needs metrics-server. CPU utilization is measured against the
+# container's CPU *request*, so requests must be set.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: inventory-api
+  namespace: inventory
+  labels:
+    app.kubernetes.io/name: inventory-api
+spec:
+  # TODO(7): scaleTargetRef -> apps/v1 Deployment inventory-api
+  minReplicas: 2
+  maxReplicas: 10
+  # TODO(7): metrics -> Resource cpu, Utilization 70%
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300   # avoid flapping

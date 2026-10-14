@@ -1,0 +1,21 @@
+# Local cluster (kind/minikube): kubectl apply -k k8s/overlays/dev
+# Uses the locally built image and an in-pod SQLite file on /tmp.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+images:
+  - name: 111122223333.dkr.ecr.us-east-1.amazonaws.com/inventory-api
+    newName: inventory-api
+    newTag: dev
+patches:
+  - path: config-patch.yaml
+  - path: secret-patch.yaml
+  # No ALB controller locally: drop the Ingress, use port-forward.
+  - patch: |-
+      $patch: delete
+      apiVersion: networking.k8s.io/v1
+      kind: Ingress
+      metadata:
+        name: inventory-api
+        namespace: inventory

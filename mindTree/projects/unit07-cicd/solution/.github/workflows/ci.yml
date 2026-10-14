@@ -1,0 +1,240 @@
+# CI on every PR; CI + CD (staging -> approval -> production) on main.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Least privilege for every job. Jobs that need more ask for it.
+permissions:
+  contents: read
+
+# One run per branch. New PR pushes cancel the stale run; main runs
+# queue instead, so a deploy is never killed halfway.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  PYTHON_VERSION: "3.13"
+  # Push and deploy only for commits that landed on main.
+  IS_MAIN: >-
+    ${{ github.event_name == 'push'
+        && github.ref == 'refs/heads/main' }}
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - run: pip install -r requirements-dev.txt
+      - run: ruff check .
+      - run: ruff format --check .
+
+  typecheck:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - run: pip install -r requirements-dev.txt
+      - run: mypy
+
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false # see every failing version, not just the first
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - run: pip install -r requirements-dev.txt
+      - run: >-
+          pytest -q
+          --junitxml=reports/junit-${{ matrix.python-version }}.xml
+      - name: Upload test report
+        if: always() # the report matters most when tests fail
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-${{ matrix.python-version }}
+          path: reports/
+          retention-days: 14
+
+  build:
+    needs: [lint, typecheck, test]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write # OIDC: short-lived AWS credentials, no keys
+    outputs:
+      image: ${{ steps.push.outputs.image }}
+    env:
+      IMAGE: >-
+        ${{ vars.ECR_REGISTRY || 'local' }}/pricing-api:${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0 # full history + tags for the version step
+      - name: Compute version from Conventional Commits
+        id: version
+        run: |
+          last=$(git describe --tags --abbrev=0 --match 'v*' \
+            2>/dev/null || echo v0.0.0)
+          range="$last..HEAD"
+          [ "$last" = v0.0.0 ] && range=HEAD
+          next=$(git log --format=%B%x00 "$range" \
+            | python3 -m scripts.next_version "$last")
+          echo "version=${next#v}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image (tagged with the git sha)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true # keep it local so we can scan before pushing
+          tags: ${{ env.IMAGE }}
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+            APP_VERSION=${{ steps.version.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Scan image (fail on fixable HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@0.33.1
+        with:
+          image-ref: ${{ env.IMAGE }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+      - name: Configure AWS credentials (OIDC)
+        if: env.IS_MAIN == 'true'
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ vars.AWS_CI_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Log in to Amazon ECR
+        if: env.IS_MAIN == 'true'
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Push and record the immutable digest
+        id: push
+        if: env.IS_MAIN == 'true'
+        run: |
+          docker push "$IMAGE"
+          digest=$(docker inspect \
+            --format '{{index .RepoDigests 0}}' "$IMAGE")
+          echo "image=$digest" >> "$GITHUB_OUTPUT"
+          echo "Pushed $digest" >> "$GITHUB_STEP_SUMMARY"
+
+  deploy-staging:
+    needs: [build]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment:
+      name: staging
+      url: ${{ vars.STAGING_URL }}
+    permissions:
+      contents: read
+      id-token: write
+    concurrency:
+      group: deploy-staging
+      cancel-in-progress: false
+    env:
+      IMAGE: ${{ needs.build.outputs.image }}
+      NAMESPACE: staging
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - run: pip install "httpx==0.28.*"
+      - uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - run: >-
+          aws eks update-kubeconfig
+          --name "${{ vars.EKS_CLUSTER }}" --region "$AWS_REGION"
+      - name: Roll out the image digest
+        run: |
+          kubectl -n "$NAMESPACE" set image \
+            deployment/pricing-api app="$IMAGE"
+          kubectl -n "$NAMESPACE" rollout status \
+            deployment/pricing-api --timeout=180s
+      - name: Smoke test
+        run: >-
+          python -m scripts.smoke_test
+          --base-url "${{ vars.STAGING_URL }}"
+          --expected-sha "$GITHUB_SHA"
+      - name: Roll back on failure
+        if: failure()
+        run: |
+          kubectl -n "$NAMESPACE" rollout undo deployment/pricing-api
+          kubectl -n "$NAMESPACE" rollout status \
+            deployment/pricing-api --timeout=180s
+
+  deploy-production:
+    # Same digest that passed staging: promote, never rebuild.
+    needs: [build, deploy-staging]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # Required reviewers on this environment = the manual approval.
+    environment:
+      name: production
+      url: ${{ vars.PRODUCTION_URL }}
+    permissions:
+      contents: read
+      id-token: write
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    env:
+      IMAGE: ${{ needs.build.outputs.image }}
+      NAMESPACE: production
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - run: pip install "httpx==0.28.*"
+      - uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - run: >-
+          aws eks update-kubeconfig
+          --name "${{ vars.EKS_CLUSTER }}" --region "$AWS_REGION"
+      - name: Roll out the image digest
+        run: |
+          kubectl -n "$NAMESPACE" set image \
+            deployment/pricing-api app="$IMAGE"
+          kubectl -n "$NAMESPACE" rollout status \
+            deployment/pricing-api --timeout=300s
+      - name: Smoke test
+        run: >-
+          python -m scripts.smoke_test
+          --base-url "${{ vars.PRODUCTION_URL }}"
+          --expected-sha "$GITHUB_SHA"
+      - name: Roll back on failure
+        if: failure()
+        run: |
+          kubectl -n "$NAMESPACE" rollout undo deployment/pricing-api
+          kubectl -n "$NAMESPACE" rollout status \
+            deployment/pricing-api --timeout=300s

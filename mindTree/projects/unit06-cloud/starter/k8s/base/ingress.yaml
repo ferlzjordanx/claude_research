@@ -1,0 +1,32 @@
+# [Provider-specific] AWS Load Balancer Controller turns this into an
+# ALB. target-type ip sends traffic straight to pod IPs (VPC CNI).
+# For a customer that forbids public endpoints use scheme: internal.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: inventory-api
+  namespace: inventory
+  labels:
+    app.kubernetes.io/name: inventory-api
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/healthcheck-path: /health/ready
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}]'
+    alb.ingress.kubernetes.io/certificate-arn: >-
+      arn:aws:acm:us-east-1:111122223333:certificate/REPLACE-ME
+    alb.ingress.kubernetes.io/target-group-attributes: >-
+      deregistration_delay.timeout_seconds=15
+spec:
+  ingressClassName: alb
+  rules:
+    - host: inventory.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: inventory-api
+                port:
+                  name: http

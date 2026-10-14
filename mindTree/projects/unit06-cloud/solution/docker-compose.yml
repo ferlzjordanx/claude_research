@@ -1,0 +1,43 @@
+# Local dev stack: docker compose up --build
+# The password below is a throwaway dev value, not a secret.
+services:
+  db:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: inventory
+      POSTGRES_PASSWORD: inventory-dev-only
+      POSTGRES_DB: inventory
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U inventory -d inventory"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    volumes:
+      # Postgres 18 images keep data under /var/lib/postgresql/18/...
+      - pgdata:/var/lib/postgresql
+
+  api:
+    build:
+      context: .
+      args:
+        GIT_SHA: ${GIT_SHA:-dev}
+    image: inventory-api:dev
+    environment:
+      APP_ENVIRONMENT: compose
+      APP_LOG_LEVEL: INFO
+      APP_DATABASE_URL: >-
+        postgresql+psycopg://inventory:inventory-dev-only@db:5432/inventory
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        # Wait for pg_isready, not just "container started".
+        condition: service_healthy
+    # Same constraints as the Kubernetes pod: catch surprises early.
+    read_only: true
+    tmpfs:
+      - /tmp
+    stop_grace_period: 30s
+
+volumes:
+  pgdata:

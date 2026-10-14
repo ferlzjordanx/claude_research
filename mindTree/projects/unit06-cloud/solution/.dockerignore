@@ -1,0 +1,15 @@
+# Keep the build context small and secret-free.
+.git
+.venv
+venv
+__pycache__
+*.pyc
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.env
+*.db
+tests
+k8s
+docker-compose.yml
+README.md

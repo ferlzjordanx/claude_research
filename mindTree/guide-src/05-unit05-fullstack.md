@@ -166,7 +166,7 @@ Key design decisions:
 
 **How it works.**
 
-- The middleware accepts the incoming ID only if it matches a safe pattern (`^[A-Za-z0-9._-]{8,64}$`), which prevents log injection; otherwise it generates one.
+- The middleware accepts the incoming ID only if it matches a safe pattern (`^[A-Za-z0-9._-]{1,64}$`), which prevents log injection; otherwise it generates one.
 - A `ContextVar` holds the ID for the duration of the request, and a logging filter stamps it on every record.
 - Errors use RFC 9457 problem details plus `request_id`, so the UI renders `detail` and shows the reference.
 - W3C Trace Context (`traceparent`) is the standard for distributed tracing; OpenTelemetry propagates it automatically (Unit 11). A request ID is the simple first step.

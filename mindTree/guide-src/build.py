@@ -158,6 +158,12 @@ def postprocess(path: Path) -> None:
 
 
 def main() -> None:
+    if len(sys.argv) == 3 and sys.argv[1] == "--check":
+        # Validate one chapter (includes resolve, code widths) without
+        # writing the document: python3 build.py --check 06-unit06.md
+        check_widths(expand((HERE / sys.argv[2]).read_text("utf-8")))
+        print("checked", sys.argv[2])
+        return
     sources = sorted(HERE.glob("[0-9]*.md"))
     combined = "\n\n".join(expand(p.read_text(encoding="utf-8")) for p in sources)
     check_widths(combined)

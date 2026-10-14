@@ -1,0 +1,85 @@
+// Declarative pipeline: the Jenkins equivalent of ci.yml.
+// Multibranch job: every branch/PR runs the checks; only main builds,
+// deploys to staging, waits for approval and deploys to production.
+//
+// Agent: a node labelled "docker" with Docker, kubectl and the AWS
+// CLI. AWS access comes from the node's IAM role (EC2 instance
+// profile, or IRSA / EKS Pod Identity for pod agents): no AWS keys
+// are stored in Jenkins.
+pipeline {
+  agent { label 'docker' }
+
+  options {
+    timeout(time: 45, unit: 'MINUTES')
+    disableConcurrentBuilds()          // like `concurrency` in GHA
+    buildDiscarder(logRotator(numToKeepStr: '30'))
+  }
+
+  environment {
+    // ECR_REGISTRY, AWS_REGION, STAGING_URL and PRODUCTION_URL are
+    // global properties set by the Jenkins admin, not secrets.
+    IMAGE = "${env.ECR_REGISTRY}/pricing-api:${env.GIT_COMMIT}"
+    PIP_DISABLE_PIP_VERSION_CHECK = '1'
+  }
+
+  stages {
+    stage('Checks') {
+      // One Python container for all checks; reuseNode keeps the
+      // same workspace so the venv is built once.
+      agent {
+        docker { image 'python:3.13-slim'; reuseNode true }
+      }
+      environment { HOME = "${env.WORKSPACE}" }  // writable pip cache
+      stages {
+        stage('Install') {
+          steps {
+            sh 'python -m venv .venv'
+            sh '.venv/bin/pip install -r requirements-dev.txt'
+          }
+        }
+        stage('Lint') {
+          steps {
+            sh '.venv/bin/ruff check .'
+            sh '.venv/bin/ruff format --check .'
+          }
+        }
+        stage('Typecheck') {
+          steps { sh '.venv/bin/mypy' }
+        }
+        stage('Test') {
+          steps {
+            sh '.venv/bin/pytest -q --junitxml=reports/junit.xml'
+          }
+          post {
+    // TODO(9b): on failure, if env.DEPLOYED_TO is set, call
+    // rollback(env.DEPLOYED_TO).
+    cleanup {
+      cleanWs()
+    }
+  }
+}
+
+// Helpers. In a real organisation these live in a shared library
+// (@Library('platform-pipeline') _) so every team deploys the same way.
+def deploy(String ns) {
+  withCredentials([file(credentialsId: "kubeconfig-${ns}",
+                        variable: 'KUBECONFIG')]) {
+    sh """
+      kubectl -n ${ns} set image deployment/pricing-api \
+        app="\$IMAGE"
+      kubectl -n ${ns} rollout status deployment/pricing-api \
+        --timeout=180s
+    """
+  }
+}
+
+def rollback(String ns) {
+  withCredentials([file(credentialsId: "kubeconfig-${ns}",
+                        variable: 'KUBECONFIG')]) {
+    sh """
+      kubectl -n ${ns} rollout undo deployment/pricing-api
+      kubectl -n ${ns} rollout status deployment/pricing-api \
+        --timeout=180s
+    """
+  }
+}
