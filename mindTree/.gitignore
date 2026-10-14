@@ -6,6 +6,6 @@ __pycache__/
 node_modules
 dist/
 *.db
-mindTree/guide-src/build/
+guide-src/build/
 test-results/
 playwright-report/
