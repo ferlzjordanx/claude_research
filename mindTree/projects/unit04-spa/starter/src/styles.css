@@ -1,0 +1,8 @@
+body { font-family: system-ui, sans-serif; margin: 2rem; max-width: 960px; }
+form { display: grid; gap: 0.5rem; margin-bottom: 1rem; max-width: 480px; }
+label { display: grid; gap: 0.25rem; }
+table { border-collapse: collapse; width: 100%; }
+th, td { border-bottom: 1px solid #ddd; padding: 0.4rem; text-align: left; }
+[role="alert"] { color: #b00020; }
+header { display: flex; gap: 1rem; align-items: center; }
+.hint { color: #666; }
