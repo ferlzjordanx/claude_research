@@ -103,7 +103,9 @@ The guide is built from the job-description requirements you supplied (the techn
 | Docker Engine | 29 | |
 | Kubernetes | 1.36 stable | ingress-nginx has been retired in favor of **Gateway API**. |
 | Anthropic Python SDK | `anthropic` 1.13: Messages API, `messages.parse()`, tool use | Default model `claude-opus-5-5`. |
-| OpenAI Python SDK | `openai` 3.31: **Responses API** (`responses.create` / `responses.parse`) | Chat Completions is **legacy but still supported**. Set the model ID with `OPENAI_MODEL` from OpenAI's models page. |
+| OpenAI Python SDK | `openai` 3.31: **Responses API** (`responses.create` / `responses.parse`) | Chat Completions is **legacy but still supported**. Set the model ID with `APP_OPENAI_MODEL` from OpenAI's models page. |
+| Playwright | `@playwright/test` 1.56+ | E2E tests that start both tiers via `webServer`. |
+| Prometheus client / OpenTelemetry | `prometheus-client` 0.2x / OTel Python 1.4x | OTel GenAI semantic conventions are **[Experimental]**. |
 | AWS Bedrock | Converse API (provider-neutral); Anthropic models also via the Mantle client | |
 
 Version-sensitive statements in the text are flagged **[Current]**, **[Legacy]**, **[Deprecated]**, **[Experimental]**, **[Provider-specific]** or **[Framework-specific]**.
