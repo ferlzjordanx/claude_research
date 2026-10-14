@@ -1,0 +1,44 @@
+# docker compose up --build
+# orders :8000  ->  payments :8001 (service DNS name "payments")
+services:
+  payments:
+    build: .
+    command: ["uvicorn", "payments.main:create_app", "--factory",
+              "--host", "0.0.0.0", "--port", "8001"]
+    environment:
+      APP_ENV: dev
+      # Rehearse an outage: APP_FAULT_ERROR_RATE=0.5 docker compose up
+      APP_FAULT_ERROR_RATE: ${APP_FAULT_ERROR_RATE:-0.0}
+      APP_FAULT_LATENCY_MS: ${APP_FAULT_LATENCY_MS:-0}
+    ports: ["8001:8001"]
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request as u;
+              u.urlopen('http://127.0.0.1:8001/health', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  orders:
+    build: .
+    command: ["uvicorn", "orders.main:create_app", "--factory",
+              "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      APP_ENV: dev
+      APP_DATABASE_URL: sqlite:////home/app/orders.db
+      APP_PAYMENTS_URL: http://payments:8001
+      APP_PAYMENTS_TIMEOUT_S: "2.0"
+      APP_RETRY_MAX_ATTEMPTS: "3"
+      APP_BREAKER_FAILURE_THRESHOLD: "5"
+      APP_BREAKER_RESET_TIMEOUT_S: "30"
+    ports: ["8000:8000"]
+    depends_on:
+      payments:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request as u;
+              u.urlopen('http://127.0.0.1:8000/health/ready', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
