@@ -1,0 +1,19 @@
+# Run before each rollout (CI applies it with the new image tag).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: support-migrate
+  namespace: support
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: support-api
+      containers:
+        - name: migrate
+          image: ECR_REGISTRY/support-api:TAG
+          command: ["alembic", "upgrade", "head"]
+          envFrom:
+            - configMapRef: {name: support-api-config}
+            - secretRef: {name: support-api-secrets}

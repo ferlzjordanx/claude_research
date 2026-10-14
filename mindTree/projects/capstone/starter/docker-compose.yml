@@ -1,0 +1,44 @@
+# Local production-like stack: web (nginx + SPA), api, postgres.
+#   docker compose up --build   ->  http://localhost:8080
+services:
+  db:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: support
+      POSTGRES_PASSWORD: support
+      POSTGRES_DB: support
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U support"]
+      interval: 5s
+      retries: 10
+    volumes:
+      - pgdata:/var/lib/postgresql
+
+  migrate:
+    build: ./backend
+    command: ["alembic", "upgrade", "head"]
+    env_file: ./backend/.env.compose
+    depends_on:
+      db:
+        condition: service_healthy
+
+  api:
+    build: ./backend
+    env_file: ./backend/.env.compose
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.healthcheck"]
+      interval: 10s
+
+  web:
+    build: ./frontend
+    ports:
+      - "8080:8080"
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  pgdata:

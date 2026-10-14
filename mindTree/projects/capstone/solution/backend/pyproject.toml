@@ -1,0 +1,23 @@
+[project]
+name = "acme-support-copilot"
+version = "1.0.0"
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 76
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "ASYNC"]
+
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = ["fastapi.Depends", "fastapi.Query"]
+
+[tool.mypy]
+strict = true
+plugins = ["pydantic.mypy"]
+packages = ["app"]

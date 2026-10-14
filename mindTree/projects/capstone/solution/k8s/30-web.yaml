@@ -1,0 +1,57 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: support-web
+  namespace: support
+  labels: {app: support-web}
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: support-web}
+  template:
+    metadata:
+      labels: {app: support-web}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+      containers:
+        - name: web
+          image: ECR_REGISTRY/support-web:TAG
+          ports: [{containerPort: 8080}]
+          readinessProbe:
+            httpGet: {path: /, port: 8080}
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {memory: 128Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: support-web
+  namespace: support
+spec:
+  selector: {app: support-web}
+  ports: [{port: 80, targetPort: 8080}]
+---
+# AWS Load Balancer Controller creates an ALB. Everything goes to
+# nginx, which serves the SPA and proxies /api/ to the API service.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: support
+  namespace: support
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}]'
+    alb.ingress.kubernetes.io/certificate-arn: ACM_CERT_ARN
+spec:
+  ingressClassName: alb
+  rules:
+    - host: support.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service: {name: support-web, port: {number: 80}}

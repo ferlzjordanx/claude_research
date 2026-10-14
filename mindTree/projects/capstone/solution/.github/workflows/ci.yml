@@ -1,0 +1,147 @@
+# CI/CD for the capstone (see Unit 7). In a real repo this file lives
+# at the repository root under .github/workflows/.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: support
+          POSTGRES_PASSWORD: support
+          POSTGRES_DB: support
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U support"
+          --health-interval 5s --health-retries 10
+    env:
+      TEST_DATABASE_URL: >-
+        postgresql+psycopg://support:support@localhost:5432/support
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -r requirements-dev.txt
+      - run: ruff check . && ruff format --check .
+      - run: mypy
+      - run: pytest -q --junitxml=junit.xml
+      - name: Migrations apply cleanly to Postgres
+        run: alembic upgrade head
+        env:
+          APP_JWT_SECRET: ci-only-secret-ci-only-secret-0123456789
+          APP_DATABASE_URL: ${{ env.TEST_DATABASE_URL }}
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck && npm test && npm run build
+
+  e2e:
+    needs: [backend, frontend]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - run: pip install -r backend/requirements.txt
+      - run: npm ci && npx playwright install --with-deps chromium
+        working-directory: frontend
+      - run: npm run e2e
+        working-directory: frontend
+        env:
+          CI: "true"
+          PYTHON: python
+
+  image:
+    if: github.ref == 'refs/heads/main'
+    needs: [e2e]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write  # OIDC: short-lived AWS credentials, no keys
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - id: meta
+        run: echo "tag=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+      - name: Build and push both images (same tag = same commit)
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          docker build -t "$REGISTRY/support-api:$TAG" backend
+          docker build -t "$REGISTRY/support-web:$TAG" frontend
+          docker push "$REGISTRY/support-api:$TAG"
+          docker push "$REGISTRY/support-web:$TAG"
+
+  deploy-staging:
+    needs: [image]
+    runs-on: ubuntu-latest
+    environment: staging
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - run: >-
+          aws eks update-kubeconfig
+          --name "${{ vars.EKS_CLUSTER }}"
+      - name: Roll out the new images
+        env:
+          TAG: ${{ needs.image.outputs.tag }}
+          REGISTRY: ${{ vars.ECR_REGISTRY }}
+        run: |
+          kubectl -n support set image deploy/support-api \
+            api="$REGISTRY/support-api:$TAG"
+          kubectl -n support rollout status deploy/support-api \
+            --timeout=180s
+      - name: Smoke test, roll back on failure
+        run: |
+          if ! curl -fsS "${{ vars.STAGING_URL }}/api/health"; then
+            kubectl -n support rollout undo deploy/support-api
+            exit 1
+          fi

@@ -1,0 +1,56 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: support-api
+  namespace: support
+  annotations:
+    # IRSA: pod gets an IAM role (e.g. to read Secrets Manager).
+    eks.amazonaws.com/role-arn: arn:aws:iam::ACCOUNT:role/support-api
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: support-api
+  namespace: support
+  labels: {app: support-api}
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: support-api}
+  strategy:
+    rollingUpdate: {maxUnavailable: 0, maxSurge: 1}
+  template:
+    metadata:
+      labels: {app: support-api}
+    spec:
+      serviceAccountName: support-api
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+      containers:
+        - name: api
+          image: ECR_REGISTRY/support-api:TAG
+          ports: [{containerPort: 8000}]
+          envFrom:
+            - configMapRef: {name: support-api-config}
+            - secretRef: {name: support-api-secrets}
+          # TODO(10): readinessProbe on /health (checks the DB) and
+          # livenessProbe on /health/live (no dependency checks).
+          resources:
+            requests: {cpu: 250m, memory: 256Mi}
+            limits: {memory: 512Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+          lifecycle:
+            preStop:
+              exec: {command: ["sleep", "5"]}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  namespace: support
+spec:
+  selector: {app: support-api}
+  ports: [{port: 8000, targetPort: 8000}]
